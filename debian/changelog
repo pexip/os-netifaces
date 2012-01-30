@@ -1,0 +1,95 @@
+netifaces (0.6-2ubuntu1) precise; urgency=low
+
+  [ Ubuntu Merge-o-Matic ]
+  * Merge from Debian testing.  Remaining changes:
+    - python-support transition.
+
+ -- Chuck Short <zulcss@ubuntu.com>  Mon, 30 Jan 2012 10:40:52 -0500
+
+netifaces (0.6-2) unstable; urgency=low
+
+  * debian/control:
+    - fix typo s/interfaceface/interface/ (Closes: #649081)
+    - Update Homepage
+
+ -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Thu, 17 Nov 2011 14:01:17 +0100
+
+netifaces (0.6-1ubuntu1) precise; urgency=low
+
+  * Merge from Debian testing.  Remaining changes:
+    - python-support transition.
+
+ -- Chuck Short <zulcss@ubuntu.com>  Sat, 31 Dec 2011 04:55:45 +0000
+
+netifaces (0.6-1) unstable; urgency=low
+
+  * New upstream version
+  * Standards-Version bumped to 3.9.2 (no changes needed)
+  * Migrate to dh_python2
+
+ -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Mon, 14 Nov 2011 22:11:05 +0100
+
+netifaces (0.5-3) unstable; urgency=low
+
+  * Standards-Version bumped to 3.9.1 (no changes needed)
+
+ -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Tue, 28 Sep 2010 15:40:34 +0200
+
+netifaces (0.5-2.1ubuntu3) precise; urgency=low
+
+  * Rebuild to drop python2.6 dependencies.
+
+ -- Matthias Klose <doko@ubuntu.com>  Sat, 31 Dec 2011 02:05:39 +0000
+
+netifaces (0.5-2.1ubuntu2) oneiric; urgency=low
+
+  * Remove incorrect DEB_PYTHON2_MODULE_PACKAGES definition from debian/rules
+    so that dh_python2 is used and python-netifaces isn't an empty package
+
+ -- Scott Kitterman <scott@kitterman.com>  Fri, 05 Aug 2011 00:49:25 -0400
+
+netifaces (0.5-2.1ubuntu1) oneiric; urgency=low
+
+  * python-support transition. 
+
+ -- Chuck Short <zulcss@ubuntu.com>  Thu, 14 Jul 2011 09:07:17 -0400
+
+netifaces (0.5-2.1build1) natty; urgency=low
+
+  * Rebuild to add support for python 2.7.
+
+ -- Matthias Klose <doko@ubuntu.com>  Fri, 03 Dec 2010 00:05:09 +0000
+
+netifaces (0.5-2.1) unstable; urgency=low
+
+  * Non-maintainer upload (with maintainer's permission).
+  * Add ‘Depends: ${python:Depends}’ (closes: #591992).
+
+ -- Jakub Wilk <jwilk@debian.org>  Sat, 07 Aug 2010 18:32:31 +0200
+
+netifaces (0.5-2) unstable; urgency=low
+
+  * Set Section: debug in python-netifaces-dbg
+  * Change iface to interface in debian/control Description
+  * Update Policy to 3.8.4 and change format to 3.0 (quilt)
+
+ -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Tue, 02 Mar 2010 13:49:07 +0100
+
+netifaces (0.5-1) unstable; urgency=low
+
+  * New upstream version
+  * Add VCS- fields in debian/control
+  * Fix lintian copyright-with-old-dh-make-debian-copyright
+  * Append (debug extension) to python-netifaces-dbg short description
+  * Bump up Standards-Version: 3.8.1 (no changes)
+  * Update debhelper and compat version to >= 7.0.0
+  * Remove debian/copyright Upstream text
+
+ -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Sun, 22 Mar 2009 12:25:56 +0100
+
+netifaces (0.4-1) unstable; urgency=low
+
+  * Initial release (Closes: #500394)
+
+ -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Sat, 27 Sep 2008 22:24:40 +0200
+

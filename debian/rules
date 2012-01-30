@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+
+include /usr/share/cdbs/1/rules/debhelper.mk
+include /usr/share/cdbs/1/class/python-distutils.mk
+
+# cdbs is confused if more than one binary package is build:
+DEB_DESTDIR=$(CURDIR)/debian/python-netifaces
+
+
+build/python-netifaces-dbg:: $(cdbs_python_build_versions:%=build-dbg-ext-%)
+
+build-dbg-ext-%:
+	python$*-dbg setup.py build
+
+
+install/python-netifaces-dbg:: $(cdbs_python_build_versions:%=install-dbg-ext-%)
+	find debian/python-netifaces-dbg ! -type d ! \( -name '*_d.so' -o -name '*.h' \) -exec rm {} \;
+	find debian/python-netifaces-dbg -depth -empty -exec rmdir {} \;
+
+install-dbg-ext-%:
+	python$*-dbg setup.py install \
+		--single-version-externally-managed \
+		--root $(CURDIR)/debian/python-netifaces-dbg
+
+binary-predeb/python-netifaces-dbg::
+	rm -rf debian/python-netifaces-dbg/usr/share/doc/python-netifaces-dbg
+	ln -s python-netifaces debian/python-netifaces-dbg/usr/share/doc/python-netifaces-dbg
+
+clean::
+	rm -rf $(CURDIR)/build
+	chmod -x $(CURDIR)/netifaces.egg-info/* 

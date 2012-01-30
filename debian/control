@@ -1,0 +1,31 @@
+Source: netifaces
+Section: python
+Priority: optional
+Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+XSBC-Original-Maintainer: Mario Izquierdo (mariodebian) <mariodebian@gmail.com>
+Build-Depends: cdbs (>= 0.4.90~), debhelper (>= 7.0.0), python-setuptools, python-all-dev (>= 2.6.6-3~), python-all-dbg
+Standards-Version: 3.9.2
+Homepage: http://alastairs-place.net/projects/netifaces/
+Vcs-Git: git://git.debian.org/~mario-guest/netifaces.git
+Vcs-Browser: http://git.debian.org/?p=users/mario-guest/netifaces.git
+
+Package: python-netifaces
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${python:Depends}
+Provides: ${python:Provides}
+Description: portable network interface information for Python
+ netifaces provides a (hopefully portable-ish) way for Python programmers to
+ get access to a list of the network interfaces on the local machine, and to
+ obtain the addresses of those network interfaces.
+
+Package: python-netifaces-dbg
+Section: debug
+Priority: extra
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, python-netifaces (= ${binary:Version}), python-dbg
+Description: portable network interface information for Python (debug extension)
+ netifaces provides a (hopefully portable-ish) way for Python programmers to
+ get access to a list of the network interfaces on the local machine, and to
+ obtain the addresses of those network interfaces.
+ .
+ This package contains debug symbols of python-netifaces

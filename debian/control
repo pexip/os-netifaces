@@ -1,13 +1,15 @@
 Source: netifaces
 Section: python
 Priority: optional
-Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+Maintainer: Pexip AS <packaging@pexip.com>
+XSBC-Pexip-Original-Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
 XSBC-Original-Maintainer: Mario Izquierdo (mariodebian) <mariodebian@gmail.com>
 Build-Depends: cdbs (>= 0.4.90~), debhelper (>= 7.0.0), python-setuptools, python-all-dev (>= 2.6.6-3~), python-all-dbg
 Standards-Version: 3.9.2
 Homepage: http://alastairs-place.net/projects/netifaces/
 Vcs-Git: git://git.debian.org/~mario-guest/netifaces.git
 Vcs-Browser: http://git.debian.org/?p=users/mario-guest/netifaces.git
+XS-Pexip-Upstream: http://archive.ubuntu.com/ubuntu/ precise
 
 Package: python-netifaces
 Architecture: any

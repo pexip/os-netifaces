@@ -1,2 +1,2 @@
 version=3
-http://alastairs-place.net/netifaces/ .*/netifaces-(.*)\.tar\.gz
+https://pypi.python.org/packages/source/n/netifaces/netifaces-(.*).tar.gz

@@ -1,5 +1,27 @@
 #include <Python.h>
 
+/* Python 3 compatibility */
+#if PY_MAJOR_VERSION >= 3
+#define PyInt_FromLong PyLong_FromLong
+#define PyString_FromString PyUnicode_FromString
+
+#define MODULE_ERROR            NULL
+#define MODULE_RETURN(v)       return (v)
+#define MODULE_INIT(name)       PyMODINIT_FUNC PyInit_##name(void)
+#define MODULE_DEF(name,doc,methods)                        \
+  static struct PyModuleDef moduledef = {                   \
+    PyModuleDef_HEAD_INIT, (name), (doc), -1, (methods), };
+#define MODULE_CREATE(obj,name,doc,methods) \
+  obj = PyModule_Create(&moduledef);
+#else /* PY_MAJOR_VERSION < 3 */
+#define MODULE_ERROR
+#define MODULE_RETURN(v)
+#define MODULE_INIT(name)       void init##name(void)
+#define MODULE_DEF(name,doc,methods)
+#define MODULE_CREATE(obj,name,doc,methods) \
+  obj = Py_InitModule3((name), (methods), (doc));
+#endif
+
 #ifndef WIN32
 
 #  include <sys/types.h>
@@ -7,18 +29,35 @@
 #  include <net/if.h>
 #  include <netdb.h>
 
+#  if HAVE_PF_ROUTE
+#    include <net/route.h>
+#  endif
+
+#  if HAVE_SYSCTL_CTL_NET
+#    include <sys/sysctl.h>
+#    include <net/route.h>
+#  endif
+
+#  if HAVE_PF_NETLINK
+#    include <asm/types.h>
+#    include <linux/netlink.h>
+#    include <linux/rtnetlink.h>
+#    include <arpa/inet.h>
+#  endif
+
 #  if HAVE_SOCKET_IOCTLS
 #    include <sys/ioctl.h>
 #    include <netinet/in.h>
 #    include <arpa/inet.h>
-#if defined(__sun)
-#include <unistd.h>
-#include <stropts.h>
-#include <sys/sockio.h>
-#endif
+#    if defined(__sun)
+#      include <unistd.h>
+#      include <stropts.h>
+#      include <sys/sockio.h>
+#    endif
 #  endif /* HAVE_SOCKET_IOCTLS */
 
-/* For logical interfaces support we convert all names to same name prefixed with l */
+/* For logical interfaces support we convert all names to same name prefixed
+   with l */
 #if HAVE_SIOCGLIFNUM
 #define CNAME(x) l##x
 #else
@@ -117,6 +156,9 @@ static int af_to_len(int af)
 #if defined(AF_IRDA) && HAVE_SOCKADDR_IRDA
   case AF_IRDA: return sizeof (struct sockaddr_irda);
 #endif
+#if defined(AF_LINK) && HAVE_SOCKADDR_DL
+  case AF_LINK: return sizeof (struct sockaddr_dl);
+#endif
   }
   return sizeof (struct sockaddr);
 }
@@ -145,8 +187,12 @@ static int af_to_len(int af)
 
 #else /* defined(WIN32) */
 
+#define _WIN32_WINNT 0x0501
+
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #  include <iphlpapi.h>
+#  include <netioapi.h>
 
 #endif /* defined(WIN32) */
 
@@ -171,6 +217,8 @@ static int af_to_len(int af)
 #else
 #  define HAVE_AF_LINK 1
 #endif
+
+/* -- Utility Functions ----------------------------------------------------- */
 
 #if !defined(WIN32)
 #if  !HAVE_GETNAMEINFO
@@ -278,9 +326,9 @@ string_from_sockaddr (struct sockaddr *addr,
     return -1;
 
   if (SA_LEN(addr) < af_to_len(addr->sa_family)) {
-    /* Someteims ifa_netmask can be truncated. So let's detruncate it.  FreeBSD
-     * PR: kern/152036: getifaddrs(3) returns truncated sockaddrs for netmasks
-     * -- http://www.freebsd.org/cgi/query-pr.cgi?pr=152036 */
+    /* Sometimes ifa_netmask can be truncated. So let's detruncate it.  FreeBSD
+       PR: kern/152036: getifaddrs(3) returns truncated sockaddrs for netmasks
+       -- http://www.freebsd.org/cgi/query-pr.cgi?pr=152036 */
     gnilen = af_to_len(addr->sa_family);
     bigaddr = calloc(1, gnilen);
     if (!bigaddr)
@@ -296,9 +344,9 @@ string_from_sockaddr (struct sockaddr *addr,
   }
 
   failure = getnameinfo (gniaddr, gnilen,
-                   buffer, buflen,
-                   NULL, 0,
-                   NI_NUMERICHOST);
+                         buffer, buflen,
+                         NULL, 0,
+                         NI_NUMERICHOST);
 
   if (bigaddr) {
     free(bigaddr);
@@ -306,7 +354,7 @@ string_from_sockaddr (struct sockaddr *addr,
   }
 
   if (failure) {
-    int n, len;
+    size_t n, len;
     char *ptr;
     const char *data;
       
@@ -352,18 +400,62 @@ string_from_sockaddr (struct sockaddr *addr,
     *--ptr = '\0';
   }
 
+  if (!buffer[0])
+    return -1;
+
   return 0;
 }
 #endif /* !defined(WIN32) */
 
+#if defined(WIN32)
 static int
-add_to_family (PyObject *result, int family, PyObject *dict)
+compare_bits (const void *pva,
+              const void *pvb,
+              unsigned bits)
 {
-  PyObject *py_family = PyInt_FromLong (family);
-  PyObject *list = PyDict_GetItem (result, py_family);
+  const unsigned char *pa = (const unsigned char *)pva;
+  const unsigned char *pb = (const unsigned char *)pvb;
+  unsigned char a, b;
+  static unsigned char masks[] = {
+    0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe
+  };
+  while (bits >= 8) {
+    a = *pa++;
+    b = *pb++;
+    if (a < b)
+      return -1;
+    else if (a > b)
+      return +1;
+    bits -= 8;
+  }
+
+  if (bits) {
+    a = *pa++ & masks[bits];
+    b = *pb++ & masks[bits];
+    if (a < b)
+      return -1;
+    else if (a > b)
+      return +1;
+  }
+
+  return 0;
+}
+#endif
+
+static int
+add_to_family (PyObject *result, int family, PyObject *obj)
+{
+  PyObject *py_family;
+  PyObject *list;
+
+  if (!PyObject_Size (obj))
+    return TRUE;
+
+  py_family = PyInt_FromLong (family);
+  list = PyDict_GetItem (result, py_family);
 
   if (!py_family) {
-    Py_DECREF (dict);
+    Py_DECREF (obj);
     Py_XDECREF (list);
     return FALSE;
   }
@@ -371,21 +463,23 @@ add_to_family (PyObject *result, int family, PyObject *dict)
   if (!list) {
     list = PyList_New (1);
     if (!list) {
-      Py_DECREF (dict);
+      Py_DECREF (obj);
       Py_DECREF (py_family);
       return FALSE;
     }
 
-    PyList_SET_ITEM (list, 0, dict);
+    PyList_SET_ITEM (list, 0, obj);
     PyDict_SetItem (result, py_family, list);
     Py_DECREF (list);
   } else {
-    PyList_Append (list, dict);
-    Py_DECREF (dict);
+    PyList_Append (list, obj);
+    Py_DECREF (obj);
   }
 
   return TRUE;
 }
+
+/* -- ifaddresses() --------------------------------------------------------- */
 
 static PyObject *
 ifaddrs (PyObject *self, PyObject *args)
@@ -394,11 +488,13 @@ ifaddrs (PyObject *self, PyObject *args)
   PyObject *result;
   int found = FALSE;
 #if defined(WIN32)
-  PIP_ADAPTER_INFO pAdapterInfo = NULL;
-  PIP_ADAPTER_INFO pInfo = NULL;
+  PIP_ADAPTER_ADDRESSES pAdapterAddresses = NULL, pInfo = NULL;
   ULONG ulBufferLength = 0;
   DWORD dwRet;
-  PIP_ADDR_STRING str;
+  PIP_ADAPTER_UNICAST_ADDRESS pUniAddr;
+#elif HAVE_GETIFADDRS
+  struct ifaddrs *addrs = NULL;
+  struct ifaddrs *addr = NULL;
 #endif
 
   if (!PyArg_ParseTuple (args, "s", &ifname))
@@ -410,17 +506,20 @@ ifaddrs (PyObject *self, PyObject *args)
     return NULL;
 
 #if defined(WIN32)
+  /* .. Win32 ............................................................... */
+
   /* First, retrieve the adapter information.  We do this in a loop, in
      case someone adds or removes adapters in the meantime. */
   do {
-    dwRet = GetAdaptersInfo(pAdapterInfo, &ulBufferLength);
+    dwRet = GetAdaptersAddresses (AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, NULL,
+                                  pAdapterAddresses, &ulBufferLength);
 
     if (dwRet == ERROR_BUFFER_OVERFLOW) {
-      if (pAdapterInfo)
-        free (pAdapterInfo);
-      pAdapterInfo = (PIP_ADAPTER_INFO)malloc (ulBufferLength);
+      if (pAdapterAddresses)
+        free (pAdapterAddresses);
+      pAdapterAddresses = (PIP_ADAPTER_ADDRESSES)malloc (ulBufferLength);
 
-      if (!pAdapterInfo) {
+      if (!pAdapterAddresses) {
         Py_DECREF (result);
         PyErr_SetString (PyExc_MemoryError, "Not enough memory");
         return NULL;
@@ -431,15 +530,15 @@ ifaddrs (PyObject *self, PyObject *args)
   /* If we failed, then fail in Python too */
   if (dwRet != ERROR_SUCCESS && dwRet != ERROR_NO_DATA) {
     Py_DECREF (result);
-    if (pAdapterInfo)
-      free (pAdapterInfo);
+    if (pAdapterAddresses)
+      free (pAdapterAddresses);
 
     PyErr_SetString (PyExc_OSError,
                      "Unable to obtain adapter information.");
     return NULL;
   }
 
-  for (pInfo = pAdapterInfo; pInfo; pInfo = pInfo->Next) {
+  for (pInfo = pAdapterAddresses; pInfo; pInfo = pInfo->Next) {
     char buffer[256];
 
     if (strcmp (pInfo->AdapterName, ifname) != 0)
@@ -448,14 +547,14 @@ ifaddrs (PyObject *self, PyObject *args)
     found = TRUE;
 
     /* Do the physical address */
-    if (256 >= 3 * pInfo->AddressLength) {
+    if (256 >= 3 * pInfo->PhysicalAddressLength) {
       PyObject *hwaddr, *dict;
       char *ptr = buffer;
       unsigned n;
       
       *ptr = '\0';
-      for (n = 0; n < pInfo->AddressLength; ++n) {
-        sprintf (ptr, "%02x:", pInfo->Address[n] & 0xff);
+      for (n = 0; n < pInfo->PhysicalAddressLength; ++n) {
+        sprintf (ptr, "%02x:", pInfo->PhysicalAddress[n] & 0xff);
         ptr += 3;
       }
       *--ptr = '\0';
@@ -466,7 +565,7 @@ ifaddrs (PyObject *self, PyObject *args)
       if (!dict) {
         Py_XDECREF (hwaddr);
         Py_DECREF (result);
-        free (pAdapterInfo);
+        free (pAdapterAddresses);
         return NULL;
       }
 
@@ -475,67 +574,235 @@ ifaddrs (PyObject *self, PyObject *args)
 
       if (!add_to_family (result, AF_LINK, dict)) {
         Py_DECREF (result);
-        free (pAdapterInfo);
+        free (pAdapterAddresses);
         return NULL;
       }
     }
 
-    for (str = &pInfo->IpAddressList; str; str = str->Next) {
-      PyObject *addr = PyString_FromString (str->IpAddress.String);
-      PyObject *mask = PyString_FromString (str->IpMask.String);
+    for (pUniAddr = pInfo->FirstUnicastAddress;
+         pUniAddr;
+         pUniAddr = pUniAddr->Next) {
+      DWORD dwLen = sizeof (buffer);
+      INT iRet = WSAAddressToStringA (pUniAddr->Address.lpSockaddr,
+                                      pUniAddr->Address.iSockaddrLength,
+                                      NULL,
+                                      buffer,
+                                      &dwLen);
+      PyObject *addr;
+      PyObject *mask = NULL;
       PyObject *bcast = NULL;
-      PyObject *dict;
+      PIP_ADAPTER_PREFIX pPrefix;
+      short family = pUniAddr->Address.lpSockaddr->sa_family;
 
-      /* If this isn't the loopback interface, work out the broadcast
-         address, for better compatibility with other platforms. */
-      if (pInfo->Type != MIB_IF_TYPE_LOOPBACK) {
-        unsigned long inaddr = inet_addr (str->IpAddress.String);
-        unsigned long inmask = inet_addr (str->IpMask.String);
-        struct in_addr in;
-        char *brstr;
+      if (iRet)
+        continue;
 
-        in.S_un.S_addr = (inaddr | ~inmask) & 0xfffffffful;
+      addr = PyString_FromString (buffer);
 
-        brstr = inet_ntoa (in);
+      /* Find the netmask, where possible */
+      if (family == AF_INET) {
+         struct sockaddr_in *pAddr
+          = (struct sockaddr_in *)pUniAddr->Address.lpSockaddr;
 
-        if (brstr)
-          bcast = PyString_FromString (brstr);
+        for (pPrefix = pInfo->FirstPrefix;
+             pPrefix;
+             pPrefix = pPrefix->Next) {
+          struct sockaddr_in *pPrefixAddr
+            = (struct sockaddr_in *)pPrefix->Address.lpSockaddr;
+          struct sockaddr_in maskAddr, bcastAddr;
+          unsigned toDo;
+          unsigned wholeBytes, remainingBits;
+          unsigned char *pMaskBits, *pBcastBits;
+
+          if (pPrefixAddr->sin_family != AF_INET)
+            continue;
+          
+          if (compare_bits (&pPrefixAddr->sin_addr,
+                            &pAddr->sin_addr,
+                            pPrefix->PrefixLength) != 0)
+            continue;
+
+          memcpy (&maskAddr,
+                  pPrefix->Address.lpSockaddr,
+                  sizeof (maskAddr));
+          memcpy (&bcastAddr,
+                  pPrefix->Address.lpSockaddr,
+                  sizeof (bcastAddr));
+                  
+          wholeBytes = pPrefix->PrefixLength >> 3;
+          remainingBits = pPrefix->PrefixLength & 7;
+
+          if (wholeBytes >= 4)
+            continue;
+
+          toDo = wholeBytes;
+          pMaskBits = (unsigned char *)&maskAddr.sin_addr;
+
+          while (toDo--)
+            *pMaskBits++ = 0xff;
+
+          toDo = 4 - wholeBytes;
+
+          pBcastBits = (unsigned char *)&bcastAddr.sin_addr + wholeBytes;
+
+          if (remainingBits) {
+            static const unsigned char masks[] = {
+              0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe
+            };
+            *pMaskBits++ = masks[remainingBits];
+            *pBcastBits &= masks[remainingBits];
+            *pBcastBits++ |= ~masks[remainingBits];
+            --toDo;
+          }
+
+          while (toDo--) {
+            *pMaskBits++ = 0;
+            *pBcastBits++ = 0xff;
+          }
+
+          dwLen = sizeof (buffer);
+          iRet = WSAAddressToStringA ((SOCKADDR *)&maskAddr,
+				      sizeof (maskAddr),
+				      NULL,
+				      buffer,
+				      &dwLen);
+
+          if (iRet == 0)
+            mask = PyString_FromString (buffer);
+          
+          dwLen = sizeof (buffer);
+          iRet = WSAAddressToStringA ((SOCKADDR *)&bcastAddr,
+				      sizeof (bcastAddr),
+				      NULL,
+				      buffer,
+				      &dwLen);
+
+          if (iRet == 0)
+            bcast = PyString_FromString (buffer);
+
+          break;
+        }
+      } else if (family == AF_INET6) {
+        struct sockaddr_in6 *pAddr
+          = (struct sockaddr_in6 *)pUniAddr->Address.lpSockaddr;
+
+        for (pPrefix = pInfo->FirstPrefix;
+             pPrefix;
+             pPrefix = pPrefix->Next) {
+          struct sockaddr_in6 *pPrefixAddr
+            = (struct sockaddr_in6 *)pPrefix->Address.lpSockaddr;
+          struct sockaddr_in6 maskAddr, bcastAddr;
+          unsigned toDo;
+          unsigned wholeBytes, remainingBits;
+          unsigned char *pMaskBits, *pBcastBits;
+
+          if (pPrefixAddr->sin6_family != AF_INET6)
+            continue;
+          
+          if (compare_bits (&pPrefixAddr->sin6_addr,
+                            &pAddr->sin6_addr,
+                            pPrefix->PrefixLength) != 0)
+            continue;
+
+          memcpy (&maskAddr,
+                  pPrefix->Address.lpSockaddr,
+                  sizeof (maskAddr));
+          memcpy (&bcastAddr,
+                  pPrefix->Address.lpSockaddr,
+                  sizeof (bcastAddr));
+                  
+          wholeBytes = pPrefix->PrefixLength >> 3;
+          remainingBits = pPrefix->PrefixLength & 7;
+
+          if (wholeBytes >= 8)
+            continue;
+
+          toDo = wholeBytes;
+          pMaskBits = (unsigned char *)&maskAddr.sin6_addr;
+
+          while (toDo--)
+            *pMaskBits++ = 0xff;
+
+          toDo = 8 - wholeBytes;
+
+          pBcastBits = (unsigned char *)&bcastAddr.sin6_addr + wholeBytes;
+
+          if (remainingBits) {
+            static const unsigned char masks[] = {
+              0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe
+            };
+            *pMaskBits++ = masks[remainingBits];
+            *pBcastBits &= masks[remainingBits];
+            *pBcastBits++ |= ~masks[remainingBits];
+            --toDo;
+          }
+
+          while (toDo--) {
+            *pMaskBits++ = 0;
+            *pBcastBits++ = 0xff;
+          }
+
+          dwLen = sizeof (buffer);
+          iRet = WSAAddressToStringA ((SOCKADDR *)&maskAddr,
+				      sizeof (maskAddr),
+				      NULL,
+				      buffer,
+				      &dwLen);
+
+          if (iRet == 0)
+            mask = PyString_FromString (buffer);
+          
+          dwLen = sizeof (buffer);
+          iRet = WSAAddressToStringA ((SOCKADDR *)&bcastAddr,
+				      sizeof (bcastAddr),
+				      NULL,
+				      buffer,
+				      &dwLen);
+
+          if (iRet == 0)
+            bcast = PyString_FromString (buffer);
+
+          break;
+        }
       }
 
-      dict = PyDict_New ();
+      {
+        PyObject *dict;
 
-      if (!dict) {
+        dict = PyDict_New ();
+
+        if (!dict) {
+          Py_XDECREF (addr);
+          Py_XDECREF (mask);
+          Py_XDECREF (bcast);
+          Py_DECREF (result);
+          free (pAdapterAddresses);
+          return NULL;
+        }
+
+        if (addr)
+          PyDict_SetItemString (dict, "addr", addr);
+        if (mask)
+          PyDict_SetItemString (dict, "netmask", mask);
+        if (bcast)
+          PyDict_SetItemString (dict, "broadcast", bcast);
+
         Py_XDECREF (addr);
         Py_XDECREF (mask);
         Py_XDECREF (bcast);
-        Py_DECREF (result);
-        free (pAdapterInfo);
-        return NULL;
-      }
 
-      if (addr)
-        PyDict_SetItemString (dict, "addr", addr);
-      if (mask)
-        PyDict_SetItemString (dict, "netmask", mask);
-      if (bcast)
-        PyDict_SetItemString (dict, "broadcast", bcast);
-
-      Py_XDECREF (addr);
-      Py_XDECREF (mask);
-      Py_XDECREF (bcast);
-
-      if (!add_to_family (result, AF_INET, dict)) {
-        Py_DECREF (result);
-        free (pAdapterInfo);
-        return NULL;
+        if (!add_to_family (result, family, dict)) {
+          Py_DECREF (result);
+          free ((void *)pAdapterAddresses);
+          return NULL;
+        }
       }
     }
   }
 
-  free (pAdapterInfo);
+  free ((void *)pAdapterAddresses);
 #elif HAVE_GETIFADDRS
-  struct ifaddrs *addrs = NULL;
-  struct ifaddrs *addr = NULL;
+  /* .. UNIX, with getifaddrs() ............................................. */
 
   if (getifaddrs (&addrs) < 0) {
     Py_DECREF (result);
@@ -550,14 +817,16 @@ ifaddrs (PyObject *self, PyObject *args)
     if (strcmp (addr->ifa_name, ifname) != 0)
       continue;
  
+    /* We mark the interface as found, even if there are no addresses;
+       this results in sensible behaviour for these few cases. */
+    found = TRUE;
+
     /* Sometimes there are records without addresses (e.g. in the case of a
        dial-up connection via ppp, which on Linux can have a link address
        record with no actual address).  We skip these as they aren't useful.
        Thanks to Christian Kauhaus for reporting this issue. */
     if (!addr->ifa_addr)
       continue;  
-
-    found = TRUE;
 
     if (string_from_sockaddr (addr->ifa_addr, buffer, sizeof (buffer)) == 0)
       pyaddr = PyString_FromString (buffer);
@@ -568,42 +837,45 @@ ifaddrs (PyObject *self, PyObject *args)
     if (string_from_sockaddr (addr->ifa_broadaddr, buffer, sizeof (buffer)) == 0)
       braddr = PyString_FromString (buffer);
 
-    PyObject *dict = PyDict_New();
+    {
+      PyObject *dict = PyDict_New();
 
-    if (!dict) {
+      if (!dict) {
+        Py_XDECREF (pyaddr);
+        Py_XDECREF (netmask);
+        Py_XDECREF (braddr);
+        Py_DECREF (result);
+        freeifaddrs (addrs);
+        return NULL;
+      }
+
+      if (pyaddr)
+        PyDict_SetItemString (dict, "addr", pyaddr);
+      if (netmask)
+        PyDict_SetItemString (dict, "netmask", netmask);
+
+      if (braddr) {
+        if (addr->ifa_flags & (IFF_POINTOPOINT | IFF_LOOPBACK))
+          PyDict_SetItemString (dict, "peer", braddr);
+        else
+          PyDict_SetItemString (dict, "broadcast", braddr);
+      }
+
       Py_XDECREF (pyaddr);
       Py_XDECREF (netmask);
       Py_XDECREF (braddr);
-      Py_DECREF (result);
-      freeifaddrs (addrs);
-      return NULL;
-    }
 
-    if (pyaddr)
-      PyDict_SetItemString (dict, "addr", pyaddr);
-    if (netmask)
-      PyDict_SetItemString (dict, "netmask", netmask);
-
-    if (braddr) {
-      if (addr->ifa_flags & (IFF_POINTOPOINT | IFF_LOOPBACK))
-        PyDict_SetItemString (dict, "peer", braddr);
-      else
-        PyDict_SetItemString (dict, "broadcast", braddr);
-    }
-
-    Py_XDECREF (pyaddr);
-    Py_XDECREF (netmask);
-    Py_XDECREF (braddr);
-
-    if (!add_to_family (result, addr->ifa_addr->sa_family, dict)) {
-      Py_DECREF (result);
-      freeifaddrs (addrs);
-      return NULL;
+      if (!add_to_family (result, addr->ifa_addr->sa_family, dict)) {
+        Py_DECREF (result);
+        freeifaddrs (addrs);
+        return NULL;
+      }
     }
   }
 
   freeifaddrs (addrs);
 #elif HAVE_SOCKET_IOCTLS
+  /* .. UNIX, with SIOC ioctls() ............................................ */
   
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -624,17 +896,13 @@ ifaddrs (PyObject *self, PyObject *args)
   if (ioctl (sock, SIOCGIFHWADDR, &ifr) == 0) {
     found = TRUE;
 
-    if (string_from_sockaddr (ifr->CNAME(ifr_addr), buffer, sizeof (buffer)) == 0) {
+    if (string_from_sockaddr ((struct sockaddr *)&ifr.CNAME(ifr_addr), buffer, sizeof (buffer)) == 0) {
       PyObject *hwaddr = PyString_FromString (buffer);
       PyObject *dict = PyDict_New ();
-      PyObject *list = PyList_New (1);
-      PyObject *family = PyInt_FromLong (AF_LINK);
 
-      if (!hwaddr || !dict || !list || !family) {
+      if (!hwaddr || !dict) {
         Py_XDECREF (hwaddr);
         Py_XDECREF (dict);
-        Py_XDECREF (list)
-        Py_XDECREF (family);
         Py_XDECREF (result);
         close (sock);
         return NULL;
@@ -643,11 +911,11 @@ ifaddrs (PyObject *self, PyObject *args)
       PyDict_SetItemString (dict, "addr", hwaddr);
       Py_DECREF (hwaddr);
 
-      PyList_SET_ITEM (list, 0, dict);
-
-      PyDict_SetItem (result, family, list);
-      Py_DECREF (family);
-      Py_DECREF (list);
+      if (!add_to_family (result, AF_LINK, dict)) {
+        Py_DECREF (result);
+        close (sock);
+        return NULL;
+      }
     }
   }
 #endif
@@ -717,61 +985,41 @@ ifaddrs (PyObject *self, PyObject *args)
   }
 #endif
 
-  PyObject *dict = PyDict_New();
+  {
+    PyObject *dict = PyDict_New();
 
-  if (!dict) {
+    if (!dict) {
+      Py_XDECREF (addr);
+      Py_XDECREF (netmask);
+      Py_XDECREF (braddr);
+      Py_XDECREF (dstaddr);
+      Py_DECREF (result);
+      close (sock);
+      return NULL;
+    }
+
+    if (addr)
+      PyDict_SetItemString (dict, "addr", addr);
+    if (netmask)
+      PyDict_SetItemString (dict, "netmask", netmask);
+    if (braddr)
+      PyDict_SetItemString (dict, "broadcast", braddr);
+    if (dstaddr)
+      PyDict_SetItemString (dict, "peer", dstaddr);
+
     Py_XDECREF (addr);
     Py_XDECREF (netmask);
     Py_XDECREF (braddr);
     Py_XDECREF (dstaddr);
-    Py_DECREF (result);
-    close (sock);
-    return NULL;
-  }
 
-  if (addr)
-    PyDict_SetItemString (dict, "addr", addr);
-  if (netmask)
-    PyDict_SetItemString (dict, "netmask", netmask);
-  if (braddr)
-    PyDict_SetItemString (dict, "broadcast", braddr);
-  if (dstaddr)
-    PyDict_SetItemString (dict, "peer", dstaddr);
-
-  Py_XDECREF (addr);
-  Py_XDECREF (netmask);
-  Py_XDECREF (braddr);
-  Py_XDECREF (dstaddr);
-
-  if (!PyDict_Size (dict))
-    Py_DECREF (dict);
-  else {
-    PyObject *list = PyList_New(1);
-  
-    if (!list) {
-      Py_DECREF (dict);
+    if (!add_to_family (result, AF_INET, dict)) {
       Py_DECREF (result);
       close (sock);
       return NULL;
     }
-
-    PyList_SET_ITEM (list, 0, dict);
-
-    PyObject *family = PyInt_FromLong (AF_INET);
-    if (!family) {
-      Py_DECREF (result);
-      Py_DECREF (list);
-      close (sock);
-      return NULL;
-    }
-
-    PyDict_SetItem (result, family, list);
-    Py_DECREF (family);
-    Py_DECREF (list);
   }
 
   close (sock);
-
 #endif /* HAVE_SOCKET_IOCTLS */
 
   if (found)
@@ -784,27 +1032,31 @@ ifaddrs (PyObject *self, PyObject *args)
   }
 }
 
+/* -- interfaces() ---------------------------------------------------------- */
+
 static PyObject *
 interfaces (PyObject *self)
 {
   PyObject *result;
 
 #if defined(WIN32)
-  PIP_ADAPTER_INFO pAdapterInfo = NULL;
-  PIP_ADAPTER_INFO pInfo = NULL;
+  /* .. Win32 ............................................................... */
+
+  PIP_ADAPTER_ADDRESSES pAdapterAddresses = NULL, pInfo = NULL;
   ULONG ulBufferLength = 0;
   DWORD dwRet;
 
   /* First, retrieve the adapter information */
   do {
-    dwRet = GetAdaptersInfo(pAdapterInfo, &ulBufferLength);
+    dwRet = GetAdaptersAddresses(AF_UNSPEC, 0, NULL,
+                                 pAdapterAddresses, &ulBufferLength);
 
     if (dwRet == ERROR_BUFFER_OVERFLOW) {
-      if (pAdapterInfo)
-        free (pAdapterInfo);
-      pAdapterInfo = (PIP_ADAPTER_INFO)malloc (ulBufferLength);
+      if (pAdapterAddresses)
+        free (pAdapterAddresses);
+      pAdapterAddresses = (PIP_ADAPTER_ADDRESSES)malloc (ulBufferLength);
 
-      if (!pAdapterInfo) {
+      if (!pAdapterAddresses) {
         PyErr_SetString (PyExc_MemoryError, "Not enough memory");
         return NULL;
       }
@@ -813,8 +1065,8 @@ interfaces (PyObject *self)
 
   /* If we failed, then fail in Python too */
   if (dwRet != ERROR_SUCCESS && dwRet != ERROR_NO_DATA) {
-    if (pAdapterInfo)
-      free (pAdapterInfo);
+    if (pAdapterAddresses)
+      free (pAdapterAddresses);
 
     PyErr_SetString (PyExc_OSError,
                      "Unable to obtain adapter information.");
@@ -824,19 +1076,21 @@ interfaces (PyObject *self)
   result = PyList_New(0);
 
   if (dwRet == ERROR_NO_DATA) {
-    free (pAdapterInfo);
+    free (pAdapterAddresses);
     return result;
   }
 
-  for (pInfo = pAdapterInfo; pInfo; pInfo = pInfo->Next) {
-    PyObject *ifname = PyString_FromString (pInfo->AdapterName);
+  for (pInfo = pAdapterAddresses; pInfo; pInfo = pInfo->Next) {
+    PyObject *ifname = (PyObject *)PyString_FromString (pInfo->AdapterName);
 
     PyList_Append (result, ifname);
     Py_DECREF (ifname);
   }
 
-  free (pAdapterInfo);
+  free (pAdapterAddresses);
 #elif HAVE_GETIFADDRS
+  /* .. UNIX, with getifaddrs() ............................................. */
+
   const char *prev_name = NULL;
   struct ifaddrs *addrs = NULL;
   struct ifaddrs *addr = NULL;
@@ -862,10 +1116,12 @@ interfaces (PyObject *self)
 
   freeifaddrs (addrs);
 #elif HAVE_SIOCGIFCONF
+  /* .. UNIX, with SIOC ioctl()s ............................................ */
+
   const char *prev_name = NULL;
   int fd = socket (AF_INET, SOCK_DGRAM, 0);
   struct CNAME(ifconf) ifc;
-  int len = -1, n;
+  int len = -1;
 
   if (fd < 0) {
     PyErr_SetFromErrno (PyExc_OSError);
@@ -893,7 +1149,7 @@ interfaces (PyObject *self)
   if (len < 0)
     len = 64;
 
-  ifc.CNAME(ifc_len) = len * sizeof (struct CNAME(ifreq));
+  ifc.CNAME(ifc_len) = (int)(len * sizeof (struct CNAME(ifreq)));
   ifc.CNAME(ifc_buf) = malloc (ifc.CNAME(ifc_len));
 
   if (!ifc.CNAME(ifc_buf)) {
@@ -915,8 +1171,9 @@ interfaces (PyObject *self)
 
   result = PyList_New (0);
   struct CNAME(ifreq) *pfreq = ifc.CNAME(ifc_req);
-  for (n = 0; n < ifc.CNAME(ifc_len)/sizeof(struct CNAME(ifreq));
-      n++,pfreq++) {
+  struct CNAME(ifreq) *pfreqend = (struct CNAME(ifreq) *)((char *)pfreq
+                                                          + ifc.CNAME(ifc_len));
+  while (pfreq < pfreqend) {
     if (!prev_name || strncmp (prev_name, pfreq->CNAME(ifr_name), IFNAMSIZ) != 0) {
       PyObject *name = PyString_FromString (pfreq->CNAME(ifr_name));
 
@@ -926,6 +1183,19 @@ interfaces (PyObject *self)
 
       prev_name = pfreq->CNAME(ifr_name);
     }
+
+#if !HAVE_SOCKADDR_SA_LEN
+    ++pfreq;
+#else
+    /* On some platforms, the ifreq struct can *grow*(!) if the socket address
+       is very long.  Mac OS X is such a platform. */
+    {
+      size_t len = sizeof (struct CNAME(ifreq));
+      if (pfreq->ifr_addr.sa_len > sizeof (struct sockaddr))
+        len = len - sizeof (struct sockaddr) + pfreq->ifr_addr.sa_len;
+        pfreq = (struct CNAME(ifreq) *)((char *)pfreq + len);
+    }
+#endif
   }
 
   free (ifc.CNAME(ifc_buf));
@@ -934,6 +1204,1065 @@ interfaces (PyObject *self)
 
   return result;
 }
+
+/* -- gateways() ------------------------------------------------------------ */
+
+static PyObject *
+gateways (PyObject *self)
+{
+  PyObject *result, *defaults;
+
+#if defined(WIN32)
+  /* .. Win32 ............................................................... */
+
+  /* We try to access GetIPForwardTable2() and FreeMibTable() through
+     function pointers so that this code will still run on machines
+     running Windows versions prior to Vista.  On those systems, we
+     fall back to the older GetIPForwardTable() API (and can only find
+     IPv4 gateways as a result).
+
+     We also fall back to the older API if the newer code fails for
+     some reason. */
+
+  HANDLE hIpHelper;
+  typedef NTSTATUS (WINAPI *PGETIPFORWARDTABLE2)(ADDRESS_FAMILY Family,
+						 PMIB_IPFORWARD_TABLE2 *pTable);
+  typedef VOID (WINAPI *PFREEMIBTABLE)(PVOID Memory);
+
+  PGETIPFORWARDTABLE2 pGetIpForwardTable2;
+  PFREEMIBTABLE pFreeMibTable;
+
+  hIpHelper = GetModuleHandle (TEXT("iphlpapi.dll"));
+
+  result = NULL;
+  pGetIpForwardTable2 = (PGETIPFORWARDTABLE2)
+    GetProcAddress (hIpHelper, "GetIpForwardTable2");
+  pFreeMibTable = (PFREEMIBTABLE)
+    GetProcAddress (hIpHelper, "FreeMibTable");
+
+  if (pGetIpForwardTable2) {
+    PMIB_IPFORWARD_TABLE2 table;
+    DWORD dwErr = pGetIpForwardTable2 (AF_UNSPEC, &table);
+
+    if (dwErr == NO_ERROR) {
+      DWORD n;
+      BOOL bFirstInet = TRUE, bFirstInet6 = TRUE;
+
+      result = PyDict_New();
+      defaults = PyDict_New();
+      PyDict_SetItemString (result, "default", defaults);
+      Py_DECREF(defaults);
+
+      /* This prevents a crash on PyPy */
+      defaults = PyDict_GetItemString (result, "default");
+
+      for (n = 0; n < table->NumEntries; ++n) {
+	MIB_IFROW ifRow;
+	PyObject *ifname;
+	PyObject *gateway;
+	PyObject *isdefault;
+	PyObject *tuple, *deftuple = NULL;
+	char gwbuf[256];
+	WCHAR *pwcsName;
+	DWORD dwFamily = table->Table[n].NextHop.si_family;
+	BOOL bFirst;
+	DWORD dwLen;
+	INT iRet;
+
+	if (table->Table[n].DestinationPrefix.PrefixLength)
+	  continue;
+
+	switch (dwFamily) {
+	case AF_INET:
+	  if (!table->Table[n].NextHop.Ipv4.sin_addr.s_addr)
+	    continue;
+	  break;
+	case AF_INET6:
+	  if (memcmp (&table->Table[n].NextHop.Ipv6.sin6_addr,
+		      &in6addr_any,
+		      sizeof (struct in6_addr)) == 0)
+	    continue;
+	  break;
+	default:
+	  continue;
+	}
+
+	memset (&ifRow, 0, sizeof (ifRow));
+	ifRow.dwIndex = table->Table[n].InterfaceIndex;
+	if (GetIfEntry (&ifRow) != NO_ERROR)
+	  continue;
+
+	dwLen = sizeof (gwbuf);
+	iRet = WSAAddressToStringA ((SOCKADDR *)&table->Table[n].NextHop,
+				    sizeof (table->Table[n].NextHop),
+				    NULL,
+				    gwbuf,
+				    &dwLen);
+
+	if (iRet != NO_ERROR)
+	  continue;
+
+	/* Strip the prefix from the interface name */
+	pwcsName = ifRow.wszName;
+	if (_wcsnicmp (L"\\DEVICE\\TCPIP_", pwcsName, 14) == 0)
+	  pwcsName += 14;
+
+	switch (dwFamily) {
+	case AF_INET:
+	  bFirst = bFirstInet;
+	  bFirstInet = FALSE;
+	  break;
+	case AF_INET6:
+	  bFirst = bFirstInet6;
+	  bFirstInet6 = FALSE;
+	  break;
+	}
+
+	ifname = PyUnicode_FromUnicode (pwcsName, wcslen (pwcsName));
+	gateway = PyString_FromString (gwbuf);
+	isdefault = bFirst ? Py_True : Py_False;
+
+	tuple = PyTuple_Pack (3, gateway, ifname, isdefault);
+
+	if (PyObject_IsTrue (isdefault))
+	  deftuple = PyTuple_Pack (2, gateway, ifname);
+
+	Py_DECREF (gateway);
+	Py_DECREF (ifname);
+
+	if (tuple && !add_to_family (result, dwFamily, tuple)) {
+	  Py_DECREF (deftuple);
+	  Py_DECREF (result);
+	  free (table);
+	  return NULL;
+	}
+
+	if (deftuple) {
+	  PyObject *pyfamily = PyInt_FromLong (dwFamily);
+
+	  PyDict_SetItem (defaults, pyfamily, deftuple);
+
+	  Py_DECREF (pyfamily);
+	  Py_DECREF (deftuple);
+	}
+      }
+
+      pFreeMibTable (table);
+    }
+  }
+
+  if (!result) {
+    PMIB_IPFORWARDTABLE table = NULL;
+    DWORD dwRet;
+    DWORD dwSize = 0;
+    DWORD n;
+    BOOL bFirst = TRUE;
+
+    do {
+      dwRet = GetIpForwardTable (table, &dwSize, FALSE);
+
+      if (dwRet == ERROR_INSUFFICIENT_BUFFER) {
+        PMIB_IPFORWARDTABLE tbl = (PMIB_IPFORWARDTABLE)realloc (table, dwSize);
+
+        if (!tbl) {
+          free (table);
+          PyErr_NoMemory();
+          return NULL;
+        }
+
+	table = tbl;
+      }
+    } while (dwRet == ERROR_INSUFFICIENT_BUFFER);
+
+    if (dwRet != NO_ERROR) {
+      free (table);
+      PyErr_SetFromWindowsErr (dwRet);
+      return NULL;
+    }
+
+    result = PyDict_New();
+    defaults = PyDict_New();
+    PyDict_SetItemString (result, "default", defaults);
+    Py_DECREF(defaults);
+
+    /* This prevents a crash on PyPy */
+    defaults = PyDict_GetItemString (result, "default");
+
+    for (n = 0; n < table->dwNumEntries; ++n) {
+      MIB_IFROW ifRow;
+      PyObject *ifname;
+      PyObject *gateway;
+      PyObject *isdefault;
+      PyObject *tuple, *deftuple = NULL;
+      DWORD dwGateway;
+      char gwbuf[16];
+      WCHAR *pwcsName;
+
+      if (table->table[n].dwForwardDest
+          || !table->table[n].dwForwardNextHop
+          || table->table[n].dwForwardType != MIB_IPROUTE_TYPE_INDIRECT)
+        continue;
+
+      memset (&ifRow, 0, sizeof (ifRow));
+      ifRow.dwIndex = table->table[n].dwForwardIfIndex;
+      if (GetIfEntry (&ifRow) != NO_ERROR)
+        continue;
+
+      dwGateway = ntohl (table->table[n].dwForwardNextHop);
+
+      sprintf (gwbuf, "%u.%u.%u.%u",
+	       (dwGateway >> 24) & 0xff,
+	       (dwGateway >> 16) & 0xff,
+	       (dwGateway >> 8) & 0xff,
+	       dwGateway & 0xff);
+
+      /* Strip the prefix from the interface name */
+      pwcsName = ifRow.wszName;
+      if (_wcsnicmp (L"\\DEVICE\\TCPIP_", pwcsName, 14) == 0)
+	pwcsName += 14;
+
+      ifname = PyUnicode_FromUnicode (pwcsName, wcslen (pwcsName));
+      gateway = PyString_FromString (gwbuf);
+      isdefault = bFirst ? Py_True : Py_False;
+      bFirst = FALSE;
+
+      tuple = PyTuple_Pack (3, gateway, ifname, isdefault);
+
+      if (PyObject_IsTrue (isdefault))
+        deftuple = PyTuple_Pack (2, gateway, ifname);
+
+      Py_DECREF (gateway);
+      Py_DECREF (ifname);
+
+      if (tuple && !add_to_family (result, AF_INET, tuple)) {
+        Py_DECREF (deftuple);
+        Py_DECREF (result);
+        free (table);
+        return NULL;
+      }
+
+      if (deftuple) {
+        PyObject *pyfamily = PyInt_FromLong (AF_INET);
+
+        PyDict_SetItem (defaults, pyfamily, deftuple);
+
+        Py_DECREF (pyfamily);
+        Py_DECREF (deftuple);
+      }
+    }
+  }
+#elif defined(HAVE_PF_NETLINK)
+  /* .. Linux (PF_NETLINK socket) ........................................... */
+
+  /* PF_NETLINK is pretty poorly documented and it looks to be quite easy to
+     get wrong.  This *appears* to be the right way to do it, even though a
+     lot of the code out there on the 'Net is very different! */
+
+  struct routing_msg {
+    struct nlmsghdr hdr;
+    struct rtmsg    rt;
+    char            data[0];
+  } *pmsg, *msgbuf;
+  int s;
+  int seq = 0;
+  ssize_t ret;
+  struct sockaddr_nl sanl;
+  static const struct sockaddr_nl sanl_kernel = { .nl_family = AF_NETLINK };
+  socklen_t sanl_len;
+  int pagesize = getpagesize();
+  int bufsize = pagesize < 8192 ? pagesize : 8192;
+  int is_multi = 0;
+  int interrupted = 0;
+
+  result = PyDict_New();
+  defaults = PyDict_New();
+  PyDict_SetItemString (result, "default", defaults);
+  Py_DECREF (defaults);
+
+  /* This prevents a crash on PyPy */
+  defaults = PyDict_GetItemString (result, "default");
+
+  msgbuf = (struct routing_msg *)malloc (bufsize);
+
+  if (!msgbuf) {
+    PyErr_NoMemory ();
+    Py_DECREF (result);
+    return NULL;
+  }
+
+  s = socket (PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+
+  if (s < 0) {
+    PyErr_SetFromErrno (PyExc_OSError);
+    Py_DECREF (result);
+    free (msgbuf);
+    return NULL;
+  }
+
+  sanl.nl_family = AF_NETLINK;
+  sanl.nl_groups = 0;
+  sanl.nl_pid = 0;
+
+  if (bind (s, (struct sockaddr *)&sanl, sizeof (sanl)) < 0) {
+    PyErr_SetFromErrno (PyExc_OSError);
+    Py_DECREF (result);
+    free (msgbuf);
+    close (s);
+    return NULL;
+  }
+
+  sanl_len = sizeof (sanl);
+  if (getsockname (s, (struct sockaddr *)&sanl, &sanl_len) < 0) {
+    PyErr_SetFromErrno  (PyExc_OSError);
+    Py_DECREF (result);
+    free (msgbuf);
+    close (s);
+    return NULL;
+  }
+
+  do {
+    interrupted = 0;
+
+    pmsg = msgbuf;
+    memset (pmsg, 0, sizeof (struct routing_msg));
+    pmsg->hdr.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    pmsg->hdr.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST;
+    pmsg->hdr.nlmsg_seq = ++seq;
+    pmsg->hdr.nlmsg_type = RTM_GETROUTE;
+    pmsg->hdr.nlmsg_pid = 0;
+
+    pmsg->rt.rtm_family = 0;
+
+    if (sendto (s, pmsg, pmsg->hdr.nlmsg_len, 0,
+                (struct sockaddr *)&sanl_kernel, sizeof(sanl_kernel)) < 0) {
+      PyErr_SetFromErrno  (PyExc_OSError);
+      Py_DECREF (result);
+      free (msgbuf);
+      close (s);
+      return NULL;
+    }
+
+    do {
+      struct sockaddr_nl sanl_from;
+      struct iovec iov = { msgbuf, bufsize };
+      struct msghdr msghdr = {
+        &sanl_from,
+        sizeof(sanl_from),
+        &iov,
+        1,
+        NULL,
+        0,
+        0
+      };
+      int nllen;
+
+      ret = recvmsg (s, &msghdr, 0);
+
+      if (msghdr.msg_flags & MSG_TRUNC) {
+        PyErr_SetString (PyExc_OSError, "netlink message truncated");
+        Py_DECREF (result);
+        free (msgbuf);
+        close (s);
+        return NULL;
+      }
+
+      if (ret < 0) {
+        PyErr_SetFromErrno (PyExc_OSError);
+        Py_DECREF (result);
+        free (msgbuf);
+        close (s);
+        return NULL;
+      }
+
+      nllen = ret;
+      pmsg = msgbuf;
+      while (NLMSG_OK (&pmsg->hdr, nllen)) {
+        void *dst = NULL;
+        void *gw = NULL;
+        int ifndx = -1;
+        struct rtattr *attrs, *attr;
+        int len;
+
+        /* Ignore messages not for us */
+        if (pmsg->hdr.nlmsg_seq != seq || pmsg->hdr.nlmsg_pid != sanl.nl_pid)
+          goto next;
+
+        /* This is only defined on Linux kernel versions 3.1 and higher */
+#ifdef NLM_F_DUMP_INTR
+        if (pmsg->hdr.nlmsg_flags & NLM_F_DUMP_INTR) {
+          /* The dump was interrupted by a signal; we need to go round again */
+          interrupted = 1;
+          is_multi = 0;
+          break;
+        }
+#endif
+
+        is_multi = pmsg->hdr.nlmsg_flags & NLM_F_MULTI;
+
+        if (pmsg->hdr.nlmsg_type == NLMSG_DONE) {
+          is_multi = interrupted = 0;
+          break;
+        }
+
+        if (pmsg->hdr.nlmsg_type == NLMSG_ERROR) {
+          struct nlmsgerr *perr = (struct nlmsgerr *)&pmsg->rt;
+          errno = -perr->error;
+          PyErr_SetFromErrno (PyExc_OSError);
+          Py_DECREF (result);
+          free (msgbuf);
+          close (s);
+          return NULL;
+        }
+
+        attr = attrs = RTM_RTA(&pmsg->rt);
+        len = RTM_PAYLOAD(&pmsg->hdr);
+
+        while (RTA_OK(attr, len)) {
+          switch (attr->rta_type) {
+          case RTA_GATEWAY:
+            gw = RTA_DATA(attr);
+            break;
+          case RTA_DST:
+            dst = RTA_DATA(attr);
+            break;
+          case RTA_OIF:
+            ifndx = *(int *)RTA_DATA(attr);
+            break;
+          default:
+            break;
+          }
+
+          attr = RTA_NEXT(attr, len);
+        }
+
+        /* We're looking for gateways with no destination */
+        if (!dst && gw && ifndx >= 0) {
+          char buffer[256];
+          char ifnamebuf[IF_NAMESIZE];
+          char *ifname;
+          const char *addr;
+          PyObject *pyifname;
+          PyObject *pyaddr;
+          PyObject *isdefault;
+          PyObject *tuple = NULL, *deftuple = NULL;
+
+          ifname = if_indextoname (ifndx, ifnamebuf);
+
+          if (!ifname)
+            goto next;
+
+          addr = inet_ntop (pmsg->rt.rtm_family, gw, buffer, sizeof (buffer));
+
+          if (!addr)
+            goto next;
+
+          /* We set isdefault to True if this route came from the main table;
+             this should correspond with the way most people set up alternate
+             routing tables on Linux. */
+
+          isdefault = pmsg->rt.rtm_table == RT_TABLE_MAIN ? Py_True : Py_False;
+          pyifname = PyString_FromString (ifname);
+          pyaddr = PyString_FromString (buffer);
+
+          tuple = PyTuple_Pack (3, pyaddr, pyifname, isdefault);
+
+          if (PyObject_IsTrue (isdefault))
+            deftuple = PyTuple_Pack (2, pyaddr, pyifname);
+
+          Py_DECREF (pyaddr);
+          Py_DECREF (pyifname);
+
+          if (tuple && !add_to_family (result, pmsg->rt.rtm_family, tuple)) {
+            Py_DECREF (deftuple);
+            Py_DECREF (result);
+            free (msgbuf);
+            close (s);
+            return NULL;
+          }
+
+          if (deftuple) {
+            PyObject *pyfamily = PyInt_FromLong (pmsg->rt.rtm_family);
+
+            PyDict_SetItem (defaults, pyfamily, deftuple);
+
+            Py_DECREF (pyfamily);
+            Py_DECREF (deftuple);
+          }
+        }
+
+      next:
+	pmsg = (struct routing_msg *)NLMSG_NEXT(&pmsg->hdr, nllen);
+      }
+    } while (is_multi);
+  } while (interrupted);
+
+  free (msgbuf);
+  close (s);
+#elif defined(HAVE_SYSCTL_CTL_NET)
+  /* .. UNIX, via sysctl() .................................................. */
+
+  int mib[] = { CTL_NET, PF_ROUTE, 0, 0, NET_RT_FLAGS,
+                RTF_UP | RTF_GATEWAY };
+  size_t len;
+  char *buffer = NULL, *ptr, *end;
+  int ret;
+  char ifnamebuf[IF_NAMESIZE];
+  char *ifname;
+
+  result = PyDict_New();
+  defaults = PyDict_New();
+  PyDict_SetItemString (result, "default", defaults);
+  Py_DECREF (defaults);
+
+  /* This prevents a crash on PyPy */
+  defaults = PyDict_GetItemString (result, "default");
+
+  /* Remembering that the routing table may change while we're reading it,
+     we need to do this in a loop until we succeed. */
+  do {
+    if (sysctl (mib, 6, 0, &len, 0, 0) < 0) {
+      PyErr_SetFromErrno (PyExc_OSError);
+      free (buffer);
+      Py_DECREF (result);
+      return NULL;
+    }
+
+    ptr = realloc(buffer, len);
+    if (!ptr) {
+      PyErr_NoMemory();
+      free (buffer);
+      Py_DECREF (result);
+      return NULL;
+    }
+
+    buffer = ptr;
+
+    ret = sysctl (mib, 6, buffer, &len, 0, 0);
+  } while (ret != 0 || errno == ENOMEM || errno == EINTR);
+
+  if (ret < 0) {
+    PyErr_SetFromErrno (PyExc_OSError);
+    free (buffer);
+    Py_DECREF (result);
+    return NULL;
+  }
+
+  ptr = buffer;
+  end = buffer + len;
+
+  while (ptr + sizeof (struct rt_msghdr) <= end) {
+    struct rt_msghdr *msg = (struct rt_msghdr *)ptr;
+    char *msgend = (char *)msg + msg->rtm_msglen;
+    int addrs = msg->rtm_addrs;
+    int addr = RTA_DST;
+    PyObject *pyifname;
+
+    if (msgend > end)
+      break;
+
+    ifname = if_indextoname (msg->rtm_index, ifnamebuf);
+
+    if (!ifname) {
+      ptr = msgend;
+      continue;
+    }
+
+    pyifname = PyString_FromString (ifname);
+
+    ptr = (char *)(msg + 1);
+    while (ptr + sizeof (struct sockaddr) <= msgend && addrs) {
+      struct sockaddr *sa = (struct sockaddr *)ptr;
+      int len = SA_LEN(sa);
+
+      if (!len)
+        len = 4;
+      else
+        len = (len + 3) & ~3;
+
+      if (ptr + len > msgend)
+        break;
+
+      while (!(addrs & addr))
+        addr <<= 1;
+
+      addrs &= ~addr;
+
+      if (addr == RTA_DST) {
+        if (sa->sa_family == AF_INET) {
+          struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+          if (sin->sin_addr.s_addr != INADDR_ANY)
+            break;
+#ifdef AF_INET6
+        } else if (sa->sa_family == AF_INET6) {
+          struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+          if (memcmp (&sin6->sin6_addr, &in6addr_any, sizeof (in6addr_any)) != 0)
+            break;
+#endif
+        } else {
+          break;
+        }
+      }
+
+      if (addr == RTA_GATEWAY) {
+        char buffer[256];
+        PyObject *tuple = NULL;
+        PyObject *deftuple = NULL;
+
+        if (string_from_sockaddr (sa, buffer, sizeof(buffer)) == 0) {
+          PyObject *pyaddr = PyString_FromString (buffer);
+#ifdef RTF_IFSCOPE
+          PyObject *isdefault = PyBool_FromLong (!(msg->rtm_flags & RTF_IFSCOPE));
+#else
+          PyObject *isdefault = Py_INCREF(Py_True);
+#endif
+          tuple = PyTuple_Pack (3, pyaddr, pyifname, isdefault);
+
+          if (PyObject_IsTrue (isdefault))
+            deftuple = PyTuple_Pack (2, pyaddr, pyifname);
+
+          Py_DECREF (pyaddr);
+          Py_DECREF (isdefault);
+        }
+
+        if (tuple && !add_to_family (result, sa->sa_family, tuple)) {
+          Py_DECREF (deftuple);
+          Py_DECREF (result);
+          Py_DECREF (pyifname);
+          free (buffer);
+          return NULL;
+        }
+
+        if (deftuple) {
+          PyObject *pyfamily = PyInt_FromLong (sa->sa_family);
+
+          PyDict_SetItem (defaults, pyfamily, deftuple);
+
+          Py_DECREF (pyfamily);
+          Py_DECREF (deftuple);
+        }
+      }
+
+      /* These are aligned on a 4-byte boundary */
+      ptr += len;
+    }
+
+    Py_DECREF (pyifname);
+    ptr = msgend;
+  }
+
+  free (buffer);
+#elif defined(HAVE_PF_ROUTE)
+  /* .. UNIX, via PF_ROUTE socket ........................................... */
+
+  /* The PF_ROUTE code will only retrieve gateway information for AF_INET and
+     AF_INET6.  This is because it would need to loop through all possible
+     values, and the messages it needs to send in each case are potentially
+     different.  It is also very likely to return a maximum of one gateway
+     in each case (since we can't read the entire routing table this way, we
+     can only ask about routes). */
+
+  int pagesize = getpagesize();
+  int bufsize = pagesize < 8192 ? 8192 : pagesize;
+  struct rt_msghdr *pmsg;
+  int s;
+  int seq = 0;
+  int pid = getpid();
+  ssize_t ret;
+  struct sockaddr_in *sin_dst, *sin_netmask;
+  struct sockaddr_dl *sdl_ifp;
+  struct sockaddr_in6 *sin6_dst;
+  size_t msglen;
+  char ifnamebuf[IF_NAMESIZE];
+  char *ifname;
+  int skip;
+
+  result = PyDict_New();
+  defaults = PyDict_New();
+  PyDict_SetItemString (result, "default", defaults);
+  Py_DECREF(defaults);
+
+  pmsg = (struct rt_msghdr *)malloc (bufsize);
+
+  if (!pmsg) {
+    PyErr_NoMemory();
+    return NULL;
+  }
+
+  s = socket (PF_ROUTE, SOCK_RAW, 0);
+
+  if (s < 0) {
+    PyErr_SetFromErrno (PyExc_OSError);
+    free (pmsg);
+    return NULL;
+  }
+
+  msglen = (sizeof (struct rt_msghdr)
+            + 2 * sizeof (struct sockaddr_in) 
+            + sizeof (struct sockaddr_dl));
+  memset (pmsg, 0, msglen);
+  
+  /* AF_INET first */
+  pmsg->rtm_msglen = msglen;
+  pmsg->rtm_type = RTM_GET;
+  pmsg->rtm_index = 0;
+  pmsg->rtm_flags = RTF_UP | RTF_GATEWAY;
+  pmsg->rtm_version = RTM_VERSION;
+  pmsg->rtm_seq = ++seq;
+  pmsg->rtm_pid = 0;
+  pmsg->rtm_addrs = RTA_DST | RTA_NETMASK | RTA_IFP;
+
+  sin_dst = (struct sockaddr_in *)(pmsg + 1);
+  sin_netmask = (struct sockaddr_in *)(sin_dst + 1);
+  sdl_ifp = (struct sockaddr_dl *)(sin_netmask + 1);
+
+  sin_dst->sin_family = AF_INET;
+  sin_netmask->sin_family = AF_INET;
+  sdl_ifp->sdl_family = AF_LINK;
+
+#if HAVE_SOCKADDR_SA_LEN
+  sin_dst->sin_len = sizeof (struct sockaddr_in);
+  sin_netmask->sin_len = sizeof (struct sockaddr_in);
+  sdl_ifp->sdl_len = sizeof (struct sockaddr_dl);
+#endif
+
+  skip = 0;
+  if (send (s, pmsg, msglen, 0) < 0) {
+    if (errno == ESRCH)
+      skip = 1;
+    else {
+      PyErr_SetFromErrno (PyExc_OSError);
+      close (s);
+      free (pmsg);
+      return NULL;
+    }
+  }
+
+  while (!skip && !(pmsg->rtm_flags & RTF_DONE)) {
+    char *ptr;
+    char *msgend;
+    int addrs;
+    int addr;
+    struct sockaddr_in *dst = NULL;
+    struct sockaddr_in *gw = NULL;
+    struct sockaddr_dl *ifp = NULL;
+    PyObject *tuple = NULL;
+    PyObject *deftuple = NULL;
+
+    do {
+      ret = recv (s, pmsg, bufsize, 0);
+    } while ((ret < 0 && errno == EINTR)
+             || (ret > 0 && (pmsg->rtm_seq != seq || pmsg->rtm_pid != pid)));
+
+    if (ret < 0) {
+      PyErr_SetFromErrno (PyExc_OSError);
+      close (s);
+      free (pmsg);
+      return NULL;
+    }
+
+    if (pmsg->rtm_errno != 0) {
+      if (pmsg->rtm_errno == ESRCH)
+        skip = 1;
+      else {
+        errno = pmsg->rtm_errno;
+        PyErr_SetFromErrno (PyExc_OSError);
+        close (s);
+        free (pmsg);
+        return NULL;
+      }
+    }
+
+    if (skip)
+      break;
+
+    ptr = (char *)(pmsg + 1);
+    msgend = (char *)pmsg + pmsg->rtm_msglen;
+    addrs = pmsg->rtm_addrs;
+    addr = RTA_DST;
+    while (ptr + sizeof (struct sockaddr) <= msgend && addrs) {
+      struct sockaddr *sa = (struct sockaddr *)ptr;
+      int len = SA_LEN(sa);
+
+      if (!len)
+        len = 4;
+      else
+        len = (len + 3) & ~3;
+
+      if (ptr + len > msgend)
+        break;
+
+      while (!(addrs & addr))
+        addr <<= 1;
+
+      addrs &= ~addr;
+
+      switch (addr) {
+      case RTA_DST:
+        dst = (struct sockaddr_in *)sa;
+        break;
+      case RTA_GATEWAY:
+        gw = (struct sockaddr_in *)sa;
+        break;
+      case RTA_IFP:
+        ifp = (struct sockaddr_dl *)sa;
+        break;
+      }
+
+      ptr += len;
+    }
+
+    if ((dst && dst->sin_family != AF_INET)
+        || (gw && gw->sin_family != AF_INET)
+        || (ifp && ifp->sdl_family != AF_LINK)) {
+      dst = gw = NULL;
+      ifp = NULL;
+    }
+
+    if (dst && dst->sin_addr.s_addr == INADDR_ANY)
+        dst = NULL;
+
+    if (!dst && gw && ifp) {
+      char buffer[256];
+
+      if (ifp->sdl_index)
+        ifname = if_indextoname (ifp->sdl_index, ifnamebuf);
+      else {
+        memcpy (ifnamebuf, ifp->sdl_data, ifp->sdl_nlen);
+        ifnamebuf[ifp->sdl_nlen] = '\0';
+        ifname = ifnamebuf;
+      }
+
+      if (string_from_sockaddr ((struct sockaddr *)gw,
+                                buffer, sizeof(buffer)) == 0) {
+        PyObject *pyifname = PyString_FromString (ifname);
+        PyObject *pyaddr = PyString_FromString (buffer);
+#ifdef RTF_IFSCOPE
+        PyObject *isdefault = PyBool_FromLong (!(pmsg->rtm_flags & RTF_IFSCOPE));
+#else
+        PyObject *isdefault = Py_True;
+	Py_INCREF(isdefault);
+#endif
+
+        tuple = PyTuple_Pack (3, pyaddr, pyifname, isdefault);
+
+        if (PyObject_IsTrue (isdefault))
+          deftuple = PyTuple_Pack (2, pyaddr, pyifname);
+
+        Py_DECREF (pyaddr);
+        Py_DECREF (pyifname);
+        Py_DECREF (isdefault);
+      }
+
+      if (tuple && !add_to_family (result, AF_INET, tuple)) {
+        Py_DECREF (deftuple);
+        Py_DECREF (result);
+        free (pmsg);
+        return NULL;
+      }
+
+      if (deftuple) {
+        PyObject *pyfamily = PyInt_FromLong (AF_INET);
+
+        PyDict_SetItem (defaults, pyfamily, deftuple);
+
+        Py_DECREF (pyfamily);
+        Py_DECREF (deftuple);
+      }
+    }
+  }
+
+  /* The code below is very similar to, but not identical to, the code above.
+     We could probably refactor some of it, but take care---there are subtle
+     differences! */
+
+#ifdef AF_INET6
+  /* AF_INET6 now */
+  msglen = (sizeof (struct rt_msghdr)
+            + sizeof (struct sockaddr_in6)
+            + sizeof (struct sockaddr_dl));
+  memset (pmsg, 0, msglen);
+
+  pmsg->rtm_msglen = msglen;
+  pmsg->rtm_type = RTM_GET;
+  pmsg->rtm_index = 0;
+  pmsg->rtm_flags = RTF_UP | RTF_GATEWAY;
+  pmsg->rtm_version = RTM_VERSION;
+  pmsg->rtm_seq = ++seq;
+  pmsg->rtm_pid = 0;
+  pmsg->rtm_addrs = RTA_DST | RTA_IFP;
+
+  sin6_dst = (struct sockaddr_in6 *)(pmsg + 1);
+  sdl_ifp = (struct sockaddr_dl *)(sin6_dst + 1);
+
+  sin6_dst->sin6_family = AF_INET6;
+  sin6_dst->sin6_addr = in6addr_any;
+  sdl_ifp->sdl_family = AF_LINK;
+
+#if HAVE_SOCKADDR_SA_LEN
+  sin6_dst->sin6_len = sizeof (struct sockaddr_in6);
+  sdl_ifp->sdl_len = sizeof (struct sockaddr_dl);
+#endif
+
+  skip = 0;
+  if (send (s, pmsg, msglen, 0) < 0) {
+    if (errno == ESRCH)
+      skip = 1;
+    else {
+      PyErr_SetFromErrno (PyExc_OSError);
+      close (s);
+      free (pmsg);
+      return NULL;
+    }
+  }
+
+  while (!skip && !(pmsg->rtm_flags & RTF_DONE)) {
+    char *ptr;
+    char *msgend;
+    int addrs;
+    int addr;
+    struct sockaddr_in6 *dst = NULL;
+    struct sockaddr_in6 *gw = NULL;
+    struct sockaddr_dl *ifp = NULL;
+    PyObject *tuple = NULL;
+    PyObject *deftuple = NULL;
+
+    do {
+      ret = recv (s, pmsg, bufsize, 0);
+    } while ((ret < 0 && errno == EINTR)
+             || (ret > 0 && (pmsg->rtm_seq != seq || pmsg->rtm_pid != pid)));
+
+    if (ret < 0) {
+      PyErr_SetFromErrno (PyExc_OSError);
+      close (s);
+      free (pmsg);
+      return NULL;
+    }
+
+    if (pmsg->rtm_errno != 0) {
+      if (pmsg->rtm_errno == ESRCH)
+        skip = 1;
+      else {
+        errno = pmsg->rtm_errno;
+        PyErr_SetFromErrno (PyExc_OSError);
+        close (s);
+        free (pmsg);
+        return NULL;
+      }
+    }
+
+    if (skip)
+      break;
+
+    ptr = (char *)(pmsg + 1);
+    msgend = (char *)pmsg + pmsg->rtm_msglen;
+    addrs = pmsg->rtm_addrs;
+    addr = RTA_DST;
+    while (ptr + sizeof (struct sockaddr) <= msgend && addrs) {
+      struct sockaddr *sa = (struct sockaddr *)ptr;
+      int len = SA_LEN(sa);
+
+      if (!len)
+        len = 4;
+      else
+        len = (len + 3) & ~3;
+
+      if (ptr + len > msgend)
+        break;
+
+      while (!(addrs & addr))
+        addr <<= 1;
+
+      addrs &= ~addr;
+
+      switch (addr) {
+      case RTA_DST:
+        dst = (struct sockaddr_in6 *)sa;
+        break;
+      case RTA_GATEWAY:
+        gw = (struct sockaddr_in6 *)sa;
+        break;
+      case RTA_IFP:
+        ifp = (struct sockaddr_dl *)sa;
+        break;
+      }
+
+      ptr += len;
+    }
+
+    if ((dst && dst->sin6_family != AF_INET6)
+        || (gw && gw->sin6_family != AF_INET6)
+        || (ifp && ifp->sdl_family != AF_LINK)) {
+      dst = gw = NULL;
+      ifp = NULL;
+    }
+
+    if (dst && memcmp (&dst->sin6_addr, &in6addr_any,
+                       sizeof(struct in6_addr)) == 0)
+        dst = NULL;
+
+    if (!dst && gw && ifp) {
+      char buffer[256];
+
+      if (ifp->sdl_index)
+        ifname = if_indextoname (ifp->sdl_index, ifnamebuf);
+      else {
+        memcpy (ifnamebuf, ifp->sdl_data, ifp->sdl_nlen);
+        ifnamebuf[ifp->sdl_nlen] = '\0';
+        ifname = ifnamebuf;
+      }
+
+      if (string_from_sockaddr ((struct sockaddr *)gw,
+                                buffer, sizeof(buffer)) == 0) {
+        PyObject *pyifname = PyString_FromString (ifname);
+        PyObject *pyaddr = PyString_FromString (buffer);
+#ifdef RTF_IFSCOPE
+        PyObject *isdefault = PyBool_FromLong (!(pmsg->rtm_flags & RTF_IFSCOPE));
+#else
+        PyObject *isdefault = Py_True;
+	Py_INCREF (isdefault);
+#endif
+
+        tuple = PyTuple_Pack (3, pyaddr, pyifname, isdefault);
+
+        if (PyObject_IsTrue (isdefault))
+          deftuple = PyTuple_Pack (2, pyaddr, pyifname);
+
+        Py_DECREF (pyaddr);
+        Py_DECREF (pyifname);
+        Py_DECREF (isdefault);
+      }
+
+      if (tuple && !add_to_family (result, AF_INET6, tuple)) {
+        Py_DECREF (deftuple);
+        Py_DECREF (result);
+        free (pmsg);
+        return NULL;
+      }
+
+      if (deftuple) {
+        PyObject *pyfamily = PyInt_FromLong (AF_INET6);
+
+        PyDict_SetItem (defaults, pyfamily, deftuple);
+
+        Py_DECREF (pyfamily);
+        Py_DECREF (deftuple);
+      }
+    }
+  }
+#endif /* AF_INET6 */
+
+  free (pmsg);
+#else
+  /* If we don't know how to implement this on your platform, we raise an
+     exception. */
+  PyErr_SetString (PyExc_OSError,
+                   "Unable to obtain gateway information on your platform.");
+#endif
+
+  return result;
+}
+
+/* -- Python Module --------------------------------------------------------- */
 
 static PyMethodDef methods[] = {
   { "ifaddresses", (PyCFunction)ifaddrs, METH_VARARGS,
@@ -944,25 +2273,42 @@ static PyMethodDef methods[] = {
 "that family that are attached to the network interface." },
   { "interfaces", (PyCFunction)interfaces, METH_NOARGS,
     "Obtain a list of the interfaces available on this machine." },
+  { "gateways", (PyCFunction)gateways, METH_NOARGS,
+    "Obtain a list of the gateways on this machine.\n"
+"\n"
+"Returns a dict whose keys are equal to the address family constants,\n"
+"e.g. netifaces.AF_INET, and whose values are a list of tuples of the\n"
+"format (<address>, <interface>, <is_default>).\n"
+"\n"
+"There is also a special entry with the key 'default', which you can use\n"
+"to quickly obtain the default gateway for a particular address family.\n"
+"\n"
+"There may in general be multiple gateways; different address\n"
+"families may have different gateway settings (e.g. AF_INET vs AF_INET6)\n"
+"and on some systems it's also possible to have interface-specific\n"
+"default gateways.\n" },
   { NULL, NULL, 0, NULL }
 };
 
-PyMODINIT_FUNC
-initnetifaces (void)
+MODULE_DEF("netifaces", NULL, methods);
+
+MODULE_INIT(netifaces)
 {
+  PyObject *address_family_dict;
   PyObject *m;
 
 #ifdef WIN32
   WSADATA wsad;
-  int iResult;
   
-  iResult = WSAStartup(MAKEWORD (2, 2), &wsad);
+  WSAStartup(MAKEWORD (2, 2), &wsad);
 #endif
 
-  m = Py_InitModule ("netifaces", methods);
+  MODULE_CREATE(m, "netifaces", NULL, methods);
+  if (!m)
+    return MODULE_ERROR;
 
   /* Address families (auto-detect using #ifdef) */
-  PyObject *address_family_dict = PyDict_New();
+  address_family_dict = PyDict_New();
 #ifdef AF_UNSPEC  
   PyModule_AddIntConstant (m, "AF_UNSPEC", AF_UNSPEC);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_UNSPEC),
@@ -1259,4 +2605,14 @@ initnetifaces (void)
           PyString_FromString("AF_BLUETOOTH"));
 #endif
   PyModule_AddObject(m, "address_families", address_family_dict);
+
+  // Add-in the version number from setup.py
+#undef STR
+#undef _STR
+#define _STR(x) #x
+#define STR(x)  _STR(x)
+
+  PyModule_AddStringConstant(m, "version", STR(NETIFACES_VERSION));
+
+  MODULE_RETURN(m);
 }

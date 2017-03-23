@@ -9,7 +9,7 @@ Standards-Version: 3.9.2
 Homepage: http://alastairs-place.net/projects/netifaces/
 Vcs-Git: git://git.debian.org/~mario-guest/netifaces.git
 Vcs-Browser: http://git.debian.org/?p=users/mario-guest/netifaces.git
-XS-Pexip-Upstream: http://archive.ubuntu.com/ubuntu/ precise
+XS-Pexip-Upstream: http://ftp.debian.org/debian/ jessie
 
 Package: python-netifaces
 Architecture: any

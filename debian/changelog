@@ -1,16 +1,47 @@
-netifaces (0.6-2ubuntu1pexip1) pexip; urgency=low
+netifaces (0.10.4-0.1pexip1) pexip; urgency=low
 
-  * Prepare Pexip packaging
+  * Migrate to Jessie
 
- -- John-Mark Bell <jmb@pexip.com>  Tue, 24 Dec 2013 23:56:17 +0000
+ -- John-Mark Bell <jmb@pexip.com>  Thu, 23 Mar 2017 11:52:35 +0000
 
-netifaces (0.6-2ubuntu1) precise; urgency=low
+netifaces (0.10.4-0.1) unstable; urgency=low
 
-  [ Ubuntu Merge-o-Matic ]
-  * Merge from Debian testing.  Remaining changes:
-    - python-support transition.
+  * Non-maintainer upload.
 
- -- Chuck Short <zulcss@ubuntu.com>  Mon, 30 Jan 2012 10:40:52 -0500
+  [ Thomas Goirand ]
+  * New upstream release (Closes: #749106).
+  * Removed useless XS-Python-Version: >= 2.6 and X-Python3-Version: >= 3.1.
+  * Added extend-diff-ignore = "^[^/]*[.]egg-info/" in debian/source/options.
+  * Upstream renamed README into README.rst, updates debian/docs accordingly.
+  * Updated Standards-Version: to 3.9.5.
+  * Rewrote debian/copyright into parseable format 1.0.
+  * Fixed duplicate descriptions in debian/control.
+  * Canonical VCS URLs, now using collab-maint.
+  * Updated debian/watch file to use pypi.
+  * Set the Debian Python Modules Team as maintainer, and Mario & myself as
+    uploaders.
+
+  [ Mario Izquierdo ]
+  * Add patch build-in-python3.3.diff (build python3 packages)
+    (Python 3.x compatibility added by Kevin Kelley <kelleyk@kelleyk.net>)
+    https://pypi.python.org/pypi/netifaces-py3
+  * debian/rules: Use new debhelper (dh) instead of cdbs
+
+ -- Thomas Goirand <zigo@debian.org>  Wed, 25 Jun 2014 10:24:29 +0000
+
+netifaces (0.8-2) unstable; urgency=low
+
+  * Standards-Version bumped to 3.9.3 (no changes needed)
+  * New patch fix-hurd-build-AF_LINK.diff:
+    - define HAVE_AF_LINK=0 in GNU/Hurd (closes: #678358)
+
+ -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Fri, 22 Jun 2012 13:53:47 +0200
+
+netifaces (0.8-1) unstable; urgency=low
+
+  * New upstream version
+
+ -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Sat, 10 Mar 2012 16:18:55 +0100
 
 netifaces (0.6-2) unstable; urgency=low
 
@@ -19,13 +50,6 @@ netifaces (0.6-2) unstable; urgency=low
     - Update Homepage
 
  -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Thu, 17 Nov 2011 14:01:17 +0100
-
-netifaces (0.6-1ubuntu1) precise; urgency=low
-
-  * Merge from Debian testing.  Remaining changes:
-    - python-support transition.
-
- -- Chuck Short <zulcss@ubuntu.com>  Sat, 31 Dec 2011 04:55:45 +0000
 
 netifaces (0.6-1) unstable; urgency=low
 
@@ -40,31 +64,6 @@ netifaces (0.5-3) unstable; urgency=low
   * Standards-Version bumped to 3.9.1 (no changes needed)
 
  -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Tue, 28 Sep 2010 15:40:34 +0200
-
-netifaces (0.5-2.1ubuntu3) precise; urgency=low
-
-  * Rebuild to drop python2.6 dependencies.
-
- -- Matthias Klose <doko@ubuntu.com>  Sat, 31 Dec 2011 02:05:39 +0000
-
-netifaces (0.5-2.1ubuntu2) oneiric; urgency=low
-
-  * Remove incorrect DEB_PYTHON2_MODULE_PACKAGES definition from debian/rules
-    so that dh_python2 is used and python-netifaces isn't an empty package
-
- -- Scott Kitterman <scott@kitterman.com>  Fri, 05 Aug 2011 00:49:25 -0400
-
-netifaces (0.5-2.1ubuntu1) oneiric; urgency=low
-
-  * python-support transition. 
-
- -- Chuck Short <zulcss@ubuntu.com>  Thu, 14 Jul 2011 09:07:17 -0400
-
-netifaces (0.5-2.1build1) natty; urgency=low
-
-  * Rebuild to add support for python 2.7.
-
- -- Matthias Klose <doko@ubuntu.com>  Fri, 03 Dec 2010 00:05:09 +0000
 
 netifaces (0.5-2.1) unstable; urgency=low
 
@@ -98,4 +97,3 @@ netifaces (0.4-1) unstable; urgency=low
   * Initial release (Closes: #500394)
 
  -- Mario Izquierdo (mariodebian) <mariodebian@gmail.com>  Sat, 27 Sep 2008 22:24:40 +0200
-

@@ -1,3 +1,13 @@
+netifaces (0.10.4-1) unstable; urgency=medium
+
+  * Points VCS URLs to Salsa.
+  * Ran wrap-and-sort -bast.
+  * Removed version of python-all-dev build-depends.
+  * Add missing dh-python build-depends.
+  * Standards-Version is now 4.1.3.
+
+ -- Thomas Goirand <zigo@debian.org>  Mon, 02 Apr 2018 22:08:38 +0200
+
 netifaces (0.10.4-0.1) unstable; urgency=low
 
   * Non-maintainer upload.

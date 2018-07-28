@@ -1,4 +1,4 @@
-netifaces (0.10.4-0.1pexip2) pexip; urgency=low
+netifaces (0.10.4-0.1+b2pexip1) pexip; urgency=low
 
   * Migrate to Stretch
 

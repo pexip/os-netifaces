@@ -1,3 +1,19 @@
+netifaces (0.10.9-0.2) unstable; urgency=medium
+
+  * Non-maintainer upload.
+  * Drop python2 support; Closes: #937129
+
+ -- Sandro Tosi <morph@debian.org>  Fri, 31 Jan 2020 00:43:09 -0500
+
+netifaces (0.10.9-0.1) unstable; urgency=medium
+
+  * Non-maintainer upload.
+  * New upstream version. Closes: #850311.
+  * Fix installation of python3.8 extension. Closes: #942685, #945474.
+  * Bump standards version.
+
+ -- Matthias Klose <doko@debian.org>  Mon, 25 Nov 2019 17:16:02 +0100
+
 netifaces (0.10.4-1) unstable; urgency=medium
 
   * Points VCS URLs to Salsa.

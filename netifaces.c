@@ -1,9 +1,21 @@
 #include <Python.h>
 
+/* Before Python 2.6, PyUnicode_FromString doesn't exist */
+#if PY_MAJOR_VERSION < 2 || (PY_MAJOR_VERSION == 2 && PY_MINOR_VERSION < 6)
+PyObject *PyUnicode_FromString(const char *s)
+{
+  Py_ssize_t len = strlen(s);
+  if (!len) {
+    Py_UNICODE uc = 0;
+    return PyUnicode_FromUnicode(&uc, 0);
+  }
+  return PyUnicode_DecodeUTF8(s, len, NULL);
+}
+#endif
+
 /* Python 3 compatibility */
 #if PY_MAJOR_VERSION >= 3
 #define PyInt_FromLong PyLong_FromLong
-#define PyString_FromString PyUnicode_FromString
 
 #define MODULE_ERROR            NULL
 #define MODULE_RETURN(v)       return (v)
@@ -38,11 +50,24 @@
 #    include <net/route.h>
 #  endif
 
+/* RTNL_FAMILY_MAX not there yet in old kernels, see linux commit 25239ce */
 #  if HAVE_PF_NETLINK
 #    include <asm/types.h>
 #    include <linux/netlink.h>
 #    include <linux/rtnetlink.h>
+#    if !defined(RTNL_FAMILY_MAX)
+#      include <linux/net.h>
+#      define RTNL_FAMILY_MAX NPROTO
+#    endif
 #    include <arpa/inet.h>
+#  endif
+
+#  if HAVE_GETIFADDRS
+#    if HAVE_IPV6_SOCKET_IOCTLS
+#      include <sys/ioctl.h>
+#      include <netinet/in.h>
+#      include <netinet/in_var.h>
+#    endif
 #  endif
 
 #  if HAVE_SOCKET_IOCTLS
@@ -315,7 +340,7 @@ getnameinfo (const struct sockaddr *addr, int addr_len,
 static int
 string_from_sockaddr (struct sockaddr *addr,
                       char *buffer,
-                      int buflen)
+                      size_t buflen)
 {
   struct sockaddr* bigaddr = 0;
   int failure;
@@ -397,13 +422,102 @@ string_from_sockaddr (struct sockaddr *addr,
       sprintf (ptr, "%02x:", data[n] & 0xff);
       ptr += 3;
     }
-    *--ptr = '\0';
+    if (len)
+      *--ptr = '\0';
   }
 
   if (!buffer[0])
     return -1;
 
   return 0;
+}
+
+/* Tries to format in CIDR form where possible; falls back to using
+   string_from_sockaddr(). */
+static int
+string_from_netmask (struct sockaddr *addr,
+                     char *buffer,
+                     size_t buflen)
+{
+#ifdef AF_INET6
+  if (addr && addr->sa_family == AF_INET6) {
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+    unsigned n = 16;
+    unsigned zeroes = 0;
+    unsigned prefix;
+    unsigned bytes;
+    char *bufptr = buffer;
+    char *bufend = buffer + buflen;
+    char pfxbuf[16];
+
+    while (n--) {
+      unsigned char byte = sin6->sin6_addr.s6_addr[n];
+
+      /* We need to count the rightmost zeroes */
+      unsigned char x = byte;
+      unsigned zx = 8;
+
+      x &= -x;
+      if (x)
+        --zx;
+      if (x & 0x0f)
+        zx -= 4;
+      if (x & 0x03)
+        zx -= 2;
+      if (x & 0x05)
+        zx -= 1;
+
+      zeroes += zx;
+
+      if (byte)
+        break;
+    }
+
+    prefix = 128 - zeroes;
+    bytes = 2 * ((prefix + 15) / 16);
+
+    for (n = 0; n < bytes; ++n) {
+      unsigned char byte = sin6->sin6_addr.s6_addr[n];
+      char ch1, ch2;
+
+      if (n && !(n & 1)) {
+        if (bufptr < bufend)
+          *bufptr++ = ':';
+      }
+
+      ch1 = '0' + (byte >> 4);
+      if (ch1 > '9')
+        ch1 += 'a' - '0' - 10;
+      ch2 = '0' + (byte & 0xf);
+      if (ch2 > '9')
+        ch2 += 'a' - '0' - 10;
+
+      if (bufptr < bufend)
+        *bufptr++ = ch1;
+      if (bufptr < bufend)
+        *bufptr++ = ch2;
+    }
+
+    if (bytes < 16) {
+      if (bufend - bufptr > 2) {
+        *bufptr++ = ':';
+        *bufptr++ = ':';
+      }
+    }
+
+    sprintf (pfxbuf, "/%u", prefix);
+
+    if (bufend - bufptr > (int)strlen(pfxbuf))
+      strcpy (bufptr, pfxbuf);
+
+    if (buflen)
+      buffer[buflen - 1] = '\0';
+
+    return 0;
+  }
+#endif
+
+  return string_from_sockaddr(addr, buffer, buflen);
 }
 #endif /* !defined(WIN32) */
 
@@ -439,6 +553,135 @@ compare_bits (const void *pva,
   }
 
   return 0;
+}
+
+static PyObject *
+netmask_from_prefix (unsigned prefix)
+{
+  char buffer[256];
+  char *bufptr = buffer;
+  char *bufend = buffer + sizeof(buffer);
+  unsigned bytes = 2 * ((prefix + 15) / 16);
+  static const unsigned char masks[] = {
+    0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe
+  };
+  unsigned n;
+  unsigned left = prefix;
+  char pfxbuf[16];
+
+  for (n = 0; n < bytes; ++n) {
+    unsigned char byte;
+    char ch1, ch2;
+
+    if (left >= 8) {
+      byte = 0xff;
+      left -= 8;
+    } else {
+      byte = masks[left];
+      left = 0;
+    }
+
+    if (n && !(n & 1)) {
+      if (bufptr < bufend)
+        *bufptr++ = ':';
+    }
+
+    ch1 = '0' + (byte >> 4);
+    if (ch1 > '9')
+      ch1 += 'a' - '0' - 10;
+    ch2 = '0' + (byte & 0xf);
+    if (ch2 > '9')
+      ch2 += 'a' - '0' - 10;
+
+    if (bufptr < bufend)
+      *bufptr++ = ch1;
+    if (bufptr < bufend)
+      *bufptr++ = ch2;
+  }
+
+  if (bytes < 16) {
+    if (bufend - bufptr > 2) {
+      *bufptr++ = ':';
+      *bufptr++ = ':';
+    }
+  }
+
+  sprintf (pfxbuf, "/%u", prefix);
+
+  if ((size_t)(bufend - bufptr) > strlen(pfxbuf))
+    strcpy (bufptr, pfxbuf);
+
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  return PyUnicode_FromString(buffer);
+}
+
+/* We dynamically bind to WSAAddressToStringW or WSAAddressToStringA
+   depending on which is available, as the latter is deprecated and
+   the former doesn't exist on all Windows versions on which this code
+   might run. */
+typedef INT (WSAAPI *WSAAddressToStringWPtr)(LPSOCKADDR, DWORD, LPWSAPROTOCOL_INFOW, LPWSTR, LPDWORD);
+typedef INT (WSAAPI *WSAAddressToStringAPtr)(LPSOCKADDR, DWORD, LPWSAPROTOCOL_INFOA, LPSTR, LPDWORD);
+
+static WSAAddressToStringWPtr
+get_address_to_string_w(void) {
+  static int ptr_is_set;
+  static WSAAddressToStringWPtr ptr;
+
+  if (!ptr_is_set) {
+    HMODULE hmod = LoadLibrary ("ws2_32.dll");
+    ptr = (WSAAddressToStringWPtr)GetProcAddress (hmod, "WSAAddressToStringW");
+    if (!ptr)
+      FreeLibrary (hmod);
+    ptr_is_set = 1;
+  }
+
+  return ptr;
+}
+
+static WSAAddressToStringAPtr
+get_address_to_string_a(void) {
+  static int ptr_is_set;
+  static WSAAddressToStringAPtr ptr;
+
+  if (!ptr_is_set) {
+    HMODULE hmod = LoadLibrary ("ws2_32.dll");
+    ptr = (WSAAddressToStringAPtr)GetProcAddress (hmod, "WSAAddressToStringA");
+    if (!ptr)
+      FreeLibrary (hmod);
+    ptr_is_set = 1;
+  }
+
+  return ptr;
+}
+
+static PyObject *
+string_from_address(SOCKADDR *addr, DWORD addrlen)
+{
+  WSAAddressToStringWPtr AddressToStringW = get_address_to_string_w();
+
+  if (AddressToStringW) {
+    wchar_t buffer[256];
+    DWORD dwLen = sizeof(buffer) / sizeof(wchar_t);
+    INT iRet;
+
+    iRet = AddressToStringW (addr, addrlen, NULL, buffer, &dwLen);
+
+    if (iRet == 0)
+      return PyUnicode_FromWideChar (buffer, dwLen - 1);
+  } else {
+    char buffer[256];
+    DWORD dwLen = sizeof(buffer);
+    WSAAddressToStringAPtr AddressToStringA = get_address_to_string_a();
+    INT iRet;
+
+    iRet = AddressToStringA (addr, addrlen, NULL, buffer, &dwLen);
+
+    if (iRet == 0)
+      return PyUnicode_FromString (buffer);
+  }
+
+  return NULL;
 }
 #endif
 
@@ -551,7 +794,7 @@ ifaddrs (PyObject *self, PyObject *args)
       PyObject *hwaddr, *dict;
       char *ptr = buffer;
       unsigned n;
-      
+
       *ptr = '\0';
       for (n = 0; n < pInfo->PhysicalAddressLength; ++n) {
         sprintf (ptr, "%02x:", pInfo->PhysicalAddress[n] & 0xff);
@@ -559,7 +802,7 @@ ifaddrs (PyObject *self, PyObject *args)
       }
       *--ptr = '\0';
 
-      hwaddr = PyString_FromString (buffer);
+      hwaddr = PyUnicode_FromString (buffer);
       dict = PyDict_New ();
 
       if (!dict) {
@@ -582,188 +825,155 @@ ifaddrs (PyObject *self, PyObject *args)
     for (pUniAddr = pInfo->FirstUnicastAddress;
          pUniAddr;
          pUniAddr = pUniAddr->Next) {
-      DWORD dwLen = sizeof (buffer);
-      INT iRet = WSAAddressToStringA (pUniAddr->Address.lpSockaddr,
-                                      pUniAddr->Address.iSockaddrLength,
-                                      NULL,
-                                      buffer,
-                                      &dwLen);
       PyObject *addr;
       PyObject *mask = NULL;
       PyObject *bcast = NULL;
       PIP_ADAPTER_PREFIX pPrefix;
       short family = pUniAddr->Address.lpSockaddr->sa_family;
 
-      if (iRet)
-        continue;
+      addr = string_from_address (pUniAddr->Address.lpSockaddr,
+                                  pUniAddr->Address.iSockaddrLength);
 
-      addr = PyString_FromString (buffer);
+      if (!addr)
+        continue;
 
       /* Find the netmask, where possible */
       if (family == AF_INET) {
-         struct sockaddr_in *pAddr
+        struct sockaddr_in *pAddr
           = (struct sockaddr_in *)pUniAddr->Address.lpSockaddr;
+        int prefix_len = -1;
+        struct sockaddr_in maskAddr, bcastAddr;
+        unsigned toDo;
+        unsigned wholeBytes, remainingBits;
+        unsigned char *pMaskBits, *pBcastBits;
+        PIP_ADAPTER_PREFIX pBest = NULL;
 
         for (pPrefix = pInfo->FirstPrefix;
              pPrefix;
              pPrefix = pPrefix->Next) {
           struct sockaddr_in *pPrefixAddr
             = (struct sockaddr_in *)pPrefix->Address.lpSockaddr;
-          struct sockaddr_in maskAddr, bcastAddr;
-          unsigned toDo;
-          unsigned wholeBytes, remainingBits;
-          unsigned char *pMaskBits, *pBcastBits;
 
-          if (pPrefixAddr->sin_family != AF_INET)
+          if (pPrefixAddr->sin_family != AF_INET
+              || (prefix_len >= 0
+		  && pPrefix->PrefixLength < (unsigned)prefix_len)
+	      || (prefix_len >= 0 && pPrefix->PrefixLength == 32))
             continue;
-          
+
           if (compare_bits (&pPrefixAddr->sin_addr,
                             &pAddr->sin_addr,
-                            pPrefix->PrefixLength) != 0)
-            continue;
-
-          memcpy (&maskAddr,
-                  pPrefix->Address.lpSockaddr,
-                  sizeof (maskAddr));
-          memcpy (&bcastAddr,
-                  pPrefix->Address.lpSockaddr,
-                  sizeof (bcastAddr));
-                  
-          wholeBytes = pPrefix->PrefixLength >> 3;
-          remainingBits = pPrefix->PrefixLength & 7;
-
-          if (wholeBytes >= 4)
-            continue;
-
-          toDo = wholeBytes;
-          pMaskBits = (unsigned char *)&maskAddr.sin_addr;
-
-          while (toDo--)
-            *pMaskBits++ = 0xff;
-
-          toDo = 4 - wholeBytes;
-
-          pBcastBits = (unsigned char *)&bcastAddr.sin_addr + wholeBytes;
-
-          if (remainingBits) {
-            static const unsigned char masks[] = {
-              0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe
-            };
-            *pMaskBits++ = masks[remainingBits];
-            *pBcastBits &= masks[remainingBits];
-            *pBcastBits++ |= ~masks[remainingBits];
-            --toDo;
+                            pPrefix->PrefixLength) == 0) {
+            prefix_len = pPrefix->PrefixLength;
+            pBest = pPrefix;
           }
-
-          while (toDo--) {
-            *pMaskBits++ = 0;
-            *pBcastBits++ = 0xff;
-          }
-
-          dwLen = sizeof (buffer);
-          iRet = WSAAddressToStringA ((SOCKADDR *)&maskAddr,
-				      sizeof (maskAddr),
-				      NULL,
-				      buffer,
-				      &dwLen);
-
-          if (iRet == 0)
-            mask = PyString_FromString (buffer);
-          
-          dwLen = sizeof (buffer);
-          iRet = WSAAddressToStringA ((SOCKADDR *)&bcastAddr,
-				      sizeof (bcastAddr),
-				      NULL,
-				      buffer,
-				      &dwLen);
-
-          if (iRet == 0)
-            bcast = PyString_FromString (buffer);
-
-          break;
         }
+
+        if (!pBest)
+          continue;
+
+        if (prefix_len < 0)
+          prefix_len = 32;
+
+        memcpy (&maskAddr,
+                pBest->Address.lpSockaddr,
+                sizeof (maskAddr));
+        memcpy (&bcastAddr,
+                pBest->Address.lpSockaddr,
+                sizeof (bcastAddr));
+
+        wholeBytes = prefix_len >> 3;
+        remainingBits = prefix_len & 7;
+
+        toDo = wholeBytes;
+        pMaskBits = (unsigned char *)&maskAddr.sin_addr;
+
+        while (toDo--)
+          *pMaskBits++ = 0xff;
+
+        toDo = 4 - wholeBytes;
+
+        pBcastBits = (unsigned char *)&bcastAddr.sin_addr + wholeBytes;
+
+        if (remainingBits) {
+          static const unsigned char masks[] = {
+            0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe
+          };
+          *pMaskBits++ = masks[remainingBits];
+          *pBcastBits &= masks[remainingBits];
+          *pBcastBits++ |= ~masks[remainingBits];
+          --toDo;
+        }
+
+        while (toDo--) {
+          *pMaskBits++ = 0;
+          *pBcastBits++ = 0xff;
+        }
+
+        mask = string_from_address ((SOCKADDR *)&maskAddr,
+                                    sizeof (maskAddr));
+        bcast = string_from_address ((SOCKADDR *)&bcastAddr,
+                                     sizeof (bcastAddr));
       } else if (family == AF_INET6) {
         struct sockaddr_in6 *pAddr
           = (struct sockaddr_in6 *)pUniAddr->Address.lpSockaddr;
+        int prefix_len = -1;
+        struct sockaddr_in6 bcastAddr;
+        unsigned toDo;
+        unsigned wholeBytes, remainingBits;
+        unsigned char *pBcastBits;
+        PIP_ADAPTER_PREFIX pBest = NULL;
 
         for (pPrefix = pInfo->FirstPrefix;
              pPrefix;
              pPrefix = pPrefix->Next) {
           struct sockaddr_in6 *pPrefixAddr
             = (struct sockaddr_in6 *)pPrefix->Address.lpSockaddr;
-          struct sockaddr_in6 maskAddr, bcastAddr;
-          unsigned toDo;
-          unsigned wholeBytes, remainingBits;
-          unsigned char *pMaskBits, *pBcastBits;
 
-          if (pPrefixAddr->sin6_family != AF_INET6)
+          if (pPrefixAddr->sin6_family != AF_INET6
+              || (prefix_len >= 0
+		  && pPrefix->PrefixLength < (unsigned)prefix_len)
+	      || (prefix_len >= 0 && pPrefix->PrefixLength == 128))
             continue;
-          
+
           if (compare_bits (&pPrefixAddr->sin6_addr,
                             &pAddr->sin6_addr,
-                            pPrefix->PrefixLength) != 0)
-            continue;
-
-          memcpy (&maskAddr,
-                  pPrefix->Address.lpSockaddr,
-                  sizeof (maskAddr));
-          memcpy (&bcastAddr,
-                  pPrefix->Address.lpSockaddr,
-                  sizeof (bcastAddr));
-                  
-          wholeBytes = pPrefix->PrefixLength >> 3;
-          remainingBits = pPrefix->PrefixLength & 7;
-
-          if (wholeBytes >= 8)
-            continue;
-
-          toDo = wholeBytes;
-          pMaskBits = (unsigned char *)&maskAddr.sin6_addr;
-
-          while (toDo--)
-            *pMaskBits++ = 0xff;
-
-          toDo = 8 - wholeBytes;
-
-          pBcastBits = (unsigned char *)&bcastAddr.sin6_addr + wholeBytes;
-
-          if (remainingBits) {
-            static const unsigned char masks[] = {
-              0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe
-            };
-            *pMaskBits++ = masks[remainingBits];
-            *pBcastBits &= masks[remainingBits];
-            *pBcastBits++ |= ~masks[remainingBits];
-            --toDo;
+                            pPrefix->PrefixLength) == 0) {
+            prefix_len = pPrefix->PrefixLength;
+            pBest = pPrefix;
           }
-
-          while (toDo--) {
-            *pMaskBits++ = 0;
-            *pBcastBits++ = 0xff;
-          }
-
-          dwLen = sizeof (buffer);
-          iRet = WSAAddressToStringA ((SOCKADDR *)&maskAddr,
-				      sizeof (maskAddr),
-				      NULL,
-				      buffer,
-				      &dwLen);
-
-          if (iRet == 0)
-            mask = PyString_FromString (buffer);
-          
-          dwLen = sizeof (buffer);
-          iRet = WSAAddressToStringA ((SOCKADDR *)&bcastAddr,
-				      sizeof (bcastAddr),
-				      NULL,
-				      buffer,
-				      &dwLen);
-
-          if (iRet == 0)
-            bcast = PyString_FromString (buffer);
-
-          break;
         }
+
+        if (!pBest)
+          continue;
+
+        if (prefix_len < 0)
+          prefix_len = 128;
+
+        memcpy (&bcastAddr,
+                pBest->Address.lpSockaddr,
+                sizeof (bcastAddr));
+
+        wholeBytes = prefix_len >> 3;
+        remainingBits = prefix_len & 7;
+
+        toDo = 16 - wholeBytes;
+
+        pBcastBits = (unsigned char *)&bcastAddr.sin6_addr + wholeBytes;
+
+        if (remainingBits) {
+          static const unsigned char masks[] = {
+            0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe
+          };
+          *pBcastBits &= masks[remainingBits];
+          *pBcastBits++ |= ~masks[remainingBits];
+          --toDo;
+        }
+
+        while (toDo--)
+          *pBcastBits++ = 0xff;
+
+        mask = netmask_from_prefix (prefix_len);
+        bcast = string_from_address ((SOCKADDR *)&bcastAddr, sizeof(bcastAddr));
       }
 
       {
@@ -812,7 +1022,7 @@ ifaddrs (PyObject *self, PyObject *args)
 
   for (addr = addrs; addr; addr = addr->ifa_next) {
     char buffer[256];
-    PyObject *pyaddr = NULL, *netmask = NULL, *braddr = NULL;
+    PyObject *pyaddr = NULL, *netmask = NULL, *braddr = NULL, *flags = NULL;
 
     if (strcmp (addr->ifa_name, ifname) != 0)
       continue;
@@ -826,16 +1036,54 @@ ifaddrs (PyObject *self, PyObject *args)
        record with no actual address).  We skip these as they aren't useful.
        Thanks to Christian Kauhaus for reporting this issue. */
     if (!addr->ifa_addr)
-      continue;  
+      continue;
+      
+#if HAVE_IPV6_SOCKET_IOCTLS
+    /* For IPv6 addresses we try to get the flags. */
+    if (addr->ifa_addr->sa_family == AF_INET6) {
+      struct sockaddr_in6 *sin;
+      struct in6_ifreq ifr6;
+      
+      int sock6 = socket (AF_INET6, SOCK_DGRAM, 0);
+
+      if (sock6 < 0) {
+        Py_DECREF (result);
+        PyErr_SetFromErrno (PyExc_OSError);
+        freeifaddrs (addrs);
+        return NULL;
+      }
+      
+      sin = (struct sockaddr_in6 *)addr->ifa_addr;
+      strncpy (ifr6.ifr_name, addr->ifa_name, IFNAMSIZ);
+      ifr6.ifr_addr = *sin;
+      
+      if (ioctl (sock6, SIOCGIFAFLAG_IN6, &ifr6) >= 0) {
+        flags = PyLong_FromUnsignedLong (ifr6.ifr_ifru.ifru_flags6);
+      }
+
+      close (sock6);
+    }
+#endif /* HAVE_IPV6_SOCKET_IOCTLS */
 
     if (string_from_sockaddr (addr->ifa_addr, buffer, sizeof (buffer)) == 0)
-      pyaddr = PyString_FromString (buffer);
+      pyaddr = PyUnicode_FromString (buffer);
 
-    if (string_from_sockaddr (addr->ifa_netmask, buffer, sizeof (buffer)) == 0)
-      netmask = PyString_FromString (buffer);
+    if (string_from_netmask (addr->ifa_netmask, buffer, sizeof (buffer)) == 0)
+      netmask = PyUnicode_FromString (buffer);
 
     if (string_from_sockaddr (addr->ifa_broadaddr, buffer, sizeof (buffer)) == 0)
-      braddr = PyString_FromString (buffer);
+      braddr = PyUnicode_FromString (buffer);
+
+    /* Cygwin's implementation of getaddrinfo() is buggy and returns broadcast
+       addresses for 169.254.0.0/16.  Nix them here. */
+    if (addr->ifa_addr->sa_family == AF_INET) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)addr->ifa_addr;
+
+      if ((ntohl(sin->sin_addr.s_addr) & 0xffff0000) == 0xa9fe0000) {
+        Py_XDECREF (braddr);
+        braddr = NULL;
+      }
+    }
 
     {
       PyObject *dict = PyDict_New();
@@ -844,6 +1092,7 @@ ifaddrs (PyObject *self, PyObject *args)
         Py_XDECREF (pyaddr);
         Py_XDECREF (netmask);
         Py_XDECREF (braddr);
+        Py_XDECREF (flags);
         Py_DECREF (result);
         freeifaddrs (addrs);
         return NULL;
@@ -860,10 +1109,14 @@ ifaddrs (PyObject *self, PyObject *args)
         else
           PyDict_SetItemString (dict, "broadcast", braddr);
       }
+      
+      if (flags)
+        PyDict_SetItemString (dict, "flags", flags);
 
       Py_XDECREF (pyaddr);
       Py_XDECREF (netmask);
       Py_XDECREF (braddr);
+      Py_XDECREF (flags);
 
       if (!add_to_family (result, addr->ifa_addr->sa_family, dict)) {
         Py_DECREF (result);
@@ -897,7 +1150,7 @@ ifaddrs (PyObject *self, PyObject *args)
     found = TRUE;
 
     if (string_from_sockaddr ((struct sockaddr *)&ifr.CNAME(ifr_addr), buffer, sizeof (buffer)) == 0) {
-      PyObject *hwaddr = PyString_FromString (buffer);
+      PyObject *hwaddr = PyUnicode_FromString (buffer);
       PyObject *dict = PyDict_New ();
 
       if (!hwaddr || !dict) {
@@ -929,7 +1182,7 @@ ifaddrs (PyObject *self, PyObject *args)
     found = TRUE;
 
     if (string_from_sockaddr ((struct sockaddr *)&ifr.CNAME(ifr_addr), buffer, sizeof (buffer)) == 0)
-      addr = PyString_FromString (buffer);
+      addr = PyUnicode_FromString (buffer);
   }
 #endif
 
@@ -942,7 +1195,7 @@ ifaddrs (PyObject *self, PyObject *args)
     found = TRUE;
 
     if (string_from_sockaddr ((struct sockaddr *)&ifr.CNAME(ifr_addr), buffer, sizeof (buffer)) == 0)
-      netmask = PyString_FromString (buffer);
+      netmask = PyUnicode_FromString (buffer);
   }
 #endif
 
@@ -968,7 +1221,7 @@ ifaddrs (PyObject *self, PyObject *args)
     found = TRUE;
 
     if (string_from_sockaddr ((struct sockaddr *)&ifr.CNAME(ifr_addr), buffer, sizeof (buffer)) == 0)
-      braddr = PyString_FromString (buffer);
+      braddr = PyUnicode_FromString (buffer);
   }
 #endif
 
@@ -981,7 +1234,7 @@ ifaddrs (PyObject *self, PyObject *args)
     found = TRUE;
 
     if (string_from_sockaddr ((struct sockaddr *)&ifr.CNAME(ifr_addr), buffer, sizeof (buffer)) == 0)
-      dstaddr = PyString_FromString (buffer);
+      dstaddr = PyUnicode_FromString (buffer);
   }
 #endif
 
@@ -1081,7 +1334,7 @@ interfaces (PyObject *self)
   }
 
   for (pInfo = pAdapterAddresses; pInfo; pInfo = pInfo->Next) {
-    PyObject *ifname = (PyObject *)PyString_FromString (pInfo->AdapterName);
+    PyObject *ifname = (PyObject *)PyUnicode_FromString (pInfo->AdapterName);
 
     PyList_Append (result, ifname);
     Py_DECREF (ifname);
@@ -1105,7 +1358,7 @@ interfaces (PyObject *self)
 
   for (addr = addrs; addr; addr = addr->ifa_next) {
     if (!prev_name || strncmp (addr->ifa_name, prev_name, IFNAMSIZ) != 0) {
-      PyObject *ifname = PyString_FromString (addr->ifa_name);
+      PyObject *ifname = PyUnicode_FromString (addr->ifa_name);
     
       if (!PySequence_Contains (result, ifname))
         PyList_Append (result, ifname);
@@ -1175,7 +1428,7 @@ interfaces (PyObject *self)
                                                           + ifc.CNAME(ifc_len));
   while (pfreq < pfreqend) {
     if (!prev_name || strncmp (prev_name, pfreq->CNAME(ifr_name), IFNAMSIZ) != 0) {
-      PyObject *name = PyString_FromString (pfreq->CNAME(ifr_name));
+      PyObject *name = PyUnicode_FromString (pfreq->CNAME(ifr_name));
 
       if (!PySequence_Contains (result, name))
         PyList_Append (result, name);
@@ -1246,7 +1499,7 @@ gateways (PyObject *self)
 
     if (dwErr == NO_ERROR) {
       DWORD n;
-      BOOL bFirstInet = TRUE, bFirstInet6 = TRUE;
+      ULONG lBestInetMetric = ~(ULONG)0, lBestInet6Metric = ~(ULONG)0;
 
       result = PyDict_New();
       defaults = PyDict_New();
@@ -1262,12 +1515,9 @@ gateways (PyObject *self)
 	PyObject *gateway;
 	PyObject *isdefault;
 	PyObject *tuple, *deftuple = NULL;
-	char gwbuf[256];
 	WCHAR *pwcsName;
 	DWORD dwFamily = table->Table[n].NextHop.si_family;
-	BOOL bFirst;
-	DWORD dwLen;
-	INT iRet;
+	BOOL bBest = FALSE;
 
 	if (table->Table[n].DestinationPrefix.PrefixLength)
 	  continue;
@@ -1292,15 +1542,11 @@ gateways (PyObject *self)
 	if (GetIfEntry (&ifRow) != NO_ERROR)
 	  continue;
 
-	dwLen = sizeof (gwbuf);
-	iRet = WSAAddressToStringA ((SOCKADDR *)&table->Table[n].NextHop,
-				    sizeof (table->Table[n].NextHop),
-				    NULL,
-				    gwbuf,
-				    &dwLen);
+        gateway = string_from_address ((SOCKADDR *)&table->Table[n].NextHop,
+                                       sizeof (table->Table[n].NextHop));
 
-	if (iRet != NO_ERROR)
-	  continue;
+        if (!gateway)
+          continue;
 
 	/* Strip the prefix from the interface name */
 	pwcsName = ifRow.wszName;
@@ -1309,18 +1555,17 @@ gateways (PyObject *self)
 
 	switch (dwFamily) {
 	case AF_INET:
-	  bFirst = bFirstInet;
-	  bFirstInet = FALSE;
+          bBest = table->Table[n].Metric < lBestInetMetric;
+          lBestInetMetric = table->Table[n].Metric;
 	  break;
 	case AF_INET6:
-	  bFirst = bFirstInet6;
-	  bFirstInet6 = FALSE;
+          bBest = table->Table[n].Metric < lBestInet6Metric;
+          lBestInet6Metric = table->Table[n].Metric;
 	  break;
 	}
 
 	ifname = PyUnicode_FromUnicode (pwcsName, wcslen (pwcsName));
-	gateway = PyString_FromString (gwbuf);
-	isdefault = bFirst ? Py_True : Py_False;
+	isdefault = bBest ? Py_True : Py_False;
 
 	tuple = PyTuple_Pack (3, gateway, ifname, isdefault);
 
@@ -1356,7 +1601,7 @@ gateways (PyObject *self)
     DWORD dwRet;
     DWORD dwSize = 0;
     DWORD n;
-    BOOL bFirst = TRUE;
+    DWORD dwBestMetric = ~(DWORD)0;
 
     do {
       dwRet = GetIpForwardTable (table, &dwSize, FALSE);
@@ -1397,6 +1642,7 @@ gateways (PyObject *self)
       DWORD dwGateway;
       char gwbuf[16];
       WCHAR *pwcsName;
+      BOOL bBest;
 
       if (table->table[n].dwForwardDest
           || !table->table[n].dwForwardNextHop
@@ -1421,10 +1667,13 @@ gateways (PyObject *self)
       if (_wcsnicmp (L"\\DEVICE\\TCPIP_", pwcsName, 14) == 0)
 	pwcsName += 14;
 
+      bBest = table->table[n].dwForwardMetric1 < dwBestMetric;
+      if (bBest)
+        dwBestMetric = table->table[n].dwForwardMetric1;
+
       ifname = PyUnicode_FromUnicode (pwcsName, wcslen (pwcsName));
-      gateway = PyString_FromString (gwbuf);
-      isdefault = bFirst ? Py_True : Py_False;
-      bFirst = FALSE;
+      gateway = PyUnicode_FromString (gwbuf);
+      isdefault = bBest ? Py_True : Py_False;
 
       tuple = PyTuple_Pack (3, gateway, ifname, isdefault);
 
@@ -1473,6 +1722,9 @@ gateways (PyObject *self)
   int bufsize = pagesize < 8192 ? pagesize : 8192;
   int is_multi = 0;
   int interrupted = 0;
+  int def_priorities[RTNL_FAMILY_MAX];
+
+  memset(def_priorities, 0xff, sizeof(def_priorities));
 
   result = PyDict_New();
   defaults = PyDict_New();
@@ -1582,6 +1834,7 @@ gateways (PyObject *self)
         int ifndx = -1;
         struct rtattr *attrs, *attr;
         int len;
+        int priority;
 
         /* Ignore messages not for us */
         if (pmsg->hdr.nlmsg_seq != seq || pmsg->hdr.nlmsg_pid != sanl.nl_pid)
@@ -1616,7 +1869,7 @@ gateways (PyObject *self)
 
         attr = attrs = RTM_RTA(&pmsg->rt);
         len = RTM_PAYLOAD(&pmsg->hdr);
-
+        priority = -1;
         while (RTA_OK(attr, len)) {
           switch (attr->rta_type) {
           case RTA_GATEWAY:
@@ -1627,6 +1880,9 @@ gateways (PyObject *self)
             break;
           case RTA_OIF:
             ifndx = *(int *)RTA_DATA(attr);
+            break;
+          case RTA_PRIORITY:
+            priority = *(int *)RTA_DATA(attr);
             break;
           default:
             break;
@@ -1661,8 +1917,21 @@ gateways (PyObject *self)
              routing tables on Linux. */
 
           isdefault = pmsg->rt.rtm_table == RT_TABLE_MAIN ? Py_True : Py_False;
-          pyifname = PyString_FromString (ifname);
-          pyaddr = PyString_FromString (buffer);
+
+          /* Try to pick the active default route based on priority (which
+             is displayed in the UI as "metric", confusingly) */
+          if (pmsg->rt.rtm_family < RTNL_FAMILY_MAX) {
+            if (def_priorities[pmsg->rt.rtm_family] == -1)
+              def_priorities[pmsg->rt.rtm_family] = priority;
+            else {
+              if (priority == -1
+                  || priority > def_priorities[pmsg->rt.rtm_family])
+                isdefault = Py_False;
+            }
+          }
+
+          pyifname = PyUnicode_FromString (ifname);
+          pyaddr = PyUnicode_FromString (buffer);
 
           tuple = PyTuple_Pack (3, pyaddr, pyifname, isdefault);
 
@@ -1673,7 +1942,7 @@ gateways (PyObject *self)
           Py_DECREF (pyifname);
 
           if (tuple && !add_to_family (result, pmsg->rt.rtm_family, tuple)) {
-            Py_DECREF (deftuple);
+            Py_XDECREF (deftuple);
             Py_DECREF (result);
             free (msgbuf);
             close (s);
@@ -1738,7 +2007,7 @@ gateways (PyObject *self)
     buffer = ptr;
 
     ret = sysctl (mib, 6, buffer, &len, 0, 0);
-  } while (ret != 0 || errno == ENOMEM || errno == EINTR);
+  } while (ret != 0 && (errno == ENOMEM || errno == EINTR));
 
   if (ret < 0) {
     PyErr_SetFromErrno (PyExc_OSError);
@@ -1767,7 +2036,7 @@ gateways (PyObject *self)
       continue;
     }
 
-    pyifname = PyString_FromString (ifname);
+    pyifname = PyUnicode_FromString (ifname);
 
     ptr = (char *)(msg + 1);
     while (ptr + sizeof (struct sockaddr) <= msgend && addrs) {
@@ -1804,16 +2073,17 @@ gateways (PyObject *self)
       }
 
       if (addr == RTA_GATEWAY) {
-        char buffer[256];
+        char strbuf[256];
         PyObject *tuple = NULL;
         PyObject *deftuple = NULL;
 
-        if (string_from_sockaddr (sa, buffer, sizeof(buffer)) == 0) {
-          PyObject *pyaddr = PyString_FromString (buffer);
+        if (string_from_sockaddr (sa, strbuf, sizeof(strbuf)) == 0) {
+          PyObject *pyaddr = PyUnicode_FromString (strbuf);
 #ifdef RTF_IFSCOPE
           PyObject *isdefault = PyBool_FromLong (!(msg->rtm_flags & RTF_IFSCOPE));
 #else
-          PyObject *isdefault = Py_INCREF(Py_True);
+          Py_INCREF(Py_True);
+          PyObject *isdefault = Py_True;
 #endif
           tuple = PyTuple_Pack (3, pyaddr, pyifname, isdefault);
 
@@ -2034,8 +2304,8 @@ gateways (PyObject *self)
 
       if (string_from_sockaddr ((struct sockaddr *)gw,
                                 buffer, sizeof(buffer)) == 0) {
-        PyObject *pyifname = PyString_FromString (ifname);
-        PyObject *pyaddr = PyString_FromString (buffer);
+        PyObject *pyifname = PyUnicode_FromString (ifname);
+        PyObject *pyaddr = PyUnicode_FromString (buffer);
 #ifdef RTF_IFSCOPE
         PyObject *isdefault = PyBool_FromLong (!(pmsg->rtm_flags & RTF_IFSCOPE));
 #else
@@ -2213,8 +2483,8 @@ gateways (PyObject *self)
 
       if (string_from_sockaddr ((struct sockaddr *)gw,
                                 buffer, sizeof(buffer)) == 0) {
-        PyObject *pyifname = PyString_FromString (ifname);
-        PyObject *pyaddr = PyString_FromString (buffer);
+        PyObject *pyifname = PyUnicode_FromString (ifname);
+        PyObject *pyaddr = PyUnicode_FromString (buffer);
 #ifdef RTF_IFSCOPE
         PyObject *isdefault = PyBool_FromLong (!(pmsg->rtm_flags & RTF_IFSCOPE));
 #else
@@ -2312,297 +2582,312 @@ MODULE_INIT(netifaces)
 #ifdef AF_UNSPEC  
   PyModule_AddIntConstant (m, "AF_UNSPEC", AF_UNSPEC);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_UNSPEC),
-          PyString_FromString("AF_UNSPEC"));
+          PyUnicode_FromString("AF_UNSPEC"));
 #endif
 #ifdef AF_UNIX
   PyModule_AddIntConstant (m, "AF_UNIX", AF_UNIX);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_UNIX),
-          PyString_FromString("AF_UNIX"));
+          PyUnicode_FromString("AF_UNIX"));
 #endif
 #ifdef AF_FILE
   PyModule_AddIntConstant (m, "AF_FILE", AF_FILE);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_FILE),
-          PyString_FromString("AF_FILE"));
+          PyUnicode_FromString("AF_FILE"));
 #endif
 #ifdef AF_INET
   PyModule_AddIntConstant (m, "AF_INET", AF_INET);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_INET),
-          PyString_FromString("AF_INET"));
+          PyUnicode_FromString("AF_INET"));
 #endif
 #ifdef AF_AX25
   PyModule_AddIntConstant (m, "AF_AX25", AF_AX25);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_AX25),
-          PyString_FromString("AF_AX25"));
+          PyUnicode_FromString("AF_AX25"));
 #endif
 #ifdef AF_IMPLINK  
   PyModule_AddIntConstant (m, "AF_IMPLINK", AF_IMPLINK);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_IMPLINK),
-          PyString_FromString("AF_IMPLINK"));
+          PyUnicode_FromString("AF_IMPLINK"));
 #endif
 #ifdef AF_PUP  
   PyModule_AddIntConstant (m, "AF_PUP", AF_PUP);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_PUP),
-          PyString_FromString("AF_PUP"));
+          PyUnicode_FromString("AF_PUP"));
 #endif
 #ifdef AF_CHAOS
   PyModule_AddIntConstant (m, "AF_CHAOS", AF_CHAOS);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_CHAOS),
-          PyString_FromString("AF_CHAOS"));
+          PyUnicode_FromString("AF_CHAOS"));
 #endif
 #ifdef AF_NS
   PyModule_AddIntConstant (m, "AF_NS", AF_NS);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NS),
-          PyString_FromString("AF_NS"));
+          PyUnicode_FromString("AF_NS"));
 #endif
 #ifdef AF_ISO
   PyModule_AddIntConstant (m, "AF_ISO", AF_ISO);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ISO),
-          PyString_FromString("AF_ISO"));
+          PyUnicode_FromString("AF_ISO"));
 #endif
 #ifdef AF_ECMA
   PyModule_AddIntConstant (m, "AF_ECMA", AF_ECMA);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ECMA),
-          PyString_FromString("AF_ECMA"));
+          PyUnicode_FromString("AF_ECMA"));
 #endif
 #ifdef AF_DATAKIT
   PyModule_AddIntConstant (m, "AF_DATAKIT", AF_DATAKIT);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_DATAKIT),
-          PyString_FromString("AF_DATAKIT"));
+          PyUnicode_FromString("AF_DATAKIT"));
 #endif
 #ifdef AF_CCITT
   PyModule_AddIntConstant (m, "AF_CCITT", AF_CCITT);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_CCITT),
-          PyString_FromString("AF_CCITT"));
+          PyUnicode_FromString("AF_CCITT"));
 #endif
 #ifdef AF_SNA
   PyModule_AddIntConstant (m, "AF_SNA", AF_SNA);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_SNA),
-          PyString_FromString("AF_SNA"));
+          PyUnicode_FromString("AF_SNA"));
 #endif
 #ifdef AF_DECnet
   PyModule_AddIntConstant (m, "AF_DECnet", AF_DECnet);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_DECnet),
-          PyString_FromString("AF_DECnet"));
+          PyUnicode_FromString("AF_DECnet"));
 #endif
 #ifdef AF_DLI
   PyModule_AddIntConstant (m, "AF_DLI", AF_DLI);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_DLI),
-          PyString_FromString("AF_DLI"));
+          PyUnicode_FromString("AF_DLI"));
 #endif
 #ifdef AF_LAT
   PyModule_AddIntConstant (m, "AF_LAT", AF_LAT);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_LAT),
-          PyString_FromString("AF_LAT"));
+          PyUnicode_FromString("AF_LAT"));
 #endif
 #ifdef AF_HYLINK
   PyModule_AddIntConstant (m, "AF_HYLINK", AF_HYLINK);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_HYLINK),
-          PyString_FromString("AF_HYLINK"));
+          PyUnicode_FromString("AF_HYLINK"));
 #endif
 #ifdef AF_APPLETALK
   PyModule_AddIntConstant (m, "AF_APPLETALK", AF_APPLETALK);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_APPLETALK),
-          PyString_FromString("AF_APPLETALK"));
+          PyUnicode_FromString("AF_APPLETALK"));
 #endif
 #ifdef AF_ROUTE
   PyModule_AddIntConstant (m, "AF_ROUTE", AF_ROUTE);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ROUTE),
-          PyString_FromString("AF_ROUTE"));
+          PyUnicode_FromString("AF_ROUTE"));
 #endif
 #ifdef AF_LINK
   PyModule_AddIntConstant (m, "AF_LINK", AF_LINK);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_LINK),
-          PyString_FromString("AF_LINK"));
+          PyUnicode_FromString("AF_LINK"));
 #endif
 #ifdef AF_PACKET
   PyModule_AddIntConstant (m, "AF_PACKET", AF_PACKET);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_PACKET),
-          PyString_FromString("AF_PACKET"));
+          PyUnicode_FromString("AF_PACKET"));
 #endif
 #ifdef AF_COIP
   PyModule_AddIntConstant (m, "AF_COIP", AF_COIP);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_COIP),
-          PyString_FromString("AF_COIP"));
+          PyUnicode_FromString("AF_COIP"));
 #endif
 #ifdef AF_CNT
   PyModule_AddIntConstant (m, "AF_CNT", AF_CNT);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_CNT),
-          PyString_FromString("AF_CNT"));
+          PyUnicode_FromString("AF_CNT"));
 #endif
 #ifdef AF_IPX
   PyModule_AddIntConstant (m, "AF_IPX", AF_IPX);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_IPX),
-          PyString_FromString("AF_IPX"));
+          PyUnicode_FromString("AF_IPX"));
 #endif
 #ifdef AF_SIP
   PyModule_AddIntConstant (m, "AF_SIP", AF_SIP);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_SIP),
-          PyString_FromString("AF_SIP"));
+          PyUnicode_FromString("AF_SIP"));
 #endif
 #ifdef AF_NDRV
   PyModule_AddIntConstant (m, "AF_NDRV", AF_NDRV);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NDRV),
-          PyString_FromString("AF_NDRV"));
+          PyUnicode_FromString("AF_NDRV"));
 #endif
 #ifdef AF_ISDN
   PyModule_AddIntConstant (m, "AF_ISDN", AF_ISDN);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ISDN),
-          PyString_FromString("AF_ISDN"));
+          PyUnicode_FromString("AF_ISDN"));
 #endif
 #ifdef AF_INET6
   PyModule_AddIntConstant (m, "AF_INET6", AF_INET6);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_INET6),
-          PyString_FromString("AF_INET6"));
+          PyUnicode_FromString("AF_INET6"));
 #endif
 #ifdef AF_NATM
   PyModule_AddIntConstant (m, "AF_NATM", AF_NATM);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NATM),
-          PyString_FromString("AF_NATM"));
+          PyUnicode_FromString("AF_NATM"));
 #endif
 #ifdef AF_SYSTEM
   PyModule_AddIntConstant (m, "AF_SYSTEM", AF_SYSTEM);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_SYSTEM),
-          PyString_FromString("AF_SYSTEM"));
+          PyUnicode_FromString("AF_SYSTEM"));
 #endif
 #ifdef AF_NETBIOS
   PyModule_AddIntConstant (m, "AF_NETBIOS", AF_NETBIOS);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NETBIOS),
-          PyString_FromString("AF_NETBIOS"));
+          PyUnicode_FromString("AF_NETBIOS"));
 #endif
 #ifdef AF_NETBEUI
   PyModule_AddIntConstant (m, "AF_NETBEUI", AF_NETBEUI);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NETBEUI),
-          PyString_FromString("AF_NETBEUI"));
+          PyUnicode_FromString("AF_NETBEUI"));
 #endif
 #ifdef AF_PPP
   PyModule_AddIntConstant (m, "AF_PPP", AF_PPP);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_PPP),
-          PyString_FromString("AF_PPP"));
+          PyUnicode_FromString("AF_PPP"));
 #endif
 #ifdef AF_ATM
   PyModule_AddIntConstant (m, "AF_ATM", AF_ATM);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ATM),
-          PyString_FromString("AF_ATM"));
+          PyUnicode_FromString("AF_ATM"));
 #endif
 #ifdef AF_ATMPVC
   PyModule_AddIntConstant (m, "AF_ATMPVC", AF_ATMPVC);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ATMPVC),
-          PyString_FromString("AF_ATMPVC"));
+          PyUnicode_FromString("AF_ATMPVC"));
 #endif
 #ifdef AF_ATMSVC
   PyModule_AddIntConstant (m, "AF_ATMSVC", AF_ATMSVC);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ATMSVC),
-          PyString_FromString("AF_ATMSVC"));
+          PyUnicode_FromString("AF_ATMSVC"));
 #endif
 #ifdef AF_NETGRAPH
   PyModule_AddIntConstant (m, "AF_NETGRAPH", AF_NETGRAPH);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NETGRAPH),
-          PyString_FromString("AF_NETGRAPH"));
+          PyUnicode_FromString("AF_NETGRAPH"));
 #endif
 #ifdef AF_VOICEVIEW
   PyModule_AddIntConstant (m, "AF_VOICEVIEW", AF_VOICEVIEW);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_VOICEVIEW),
-          PyString_FromString("AF_VOICEVIEW"));
+          PyUnicode_FromString("AF_VOICEVIEW"));
 #endif
 #ifdef AF_FIREFOX
   PyModule_AddIntConstant (m, "AF_FIREFOX", AF_FIREFOX);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_FIREFOX),
-          PyString_FromString("AF_FIREFOX"));
+          PyUnicode_FromString("AF_FIREFOX"));
 #endif
 #ifdef AF_UNKNOWN1
   PyModule_AddIntConstant (m, "AF_UNKNOWN1", AF_UNKNOWN1);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_UNKNOWN1),
-          PyString_FromString("AF_UNKNOWN1"));
+          PyUnicode_FromString("AF_UNKNOWN1"));
 #endif
 #ifdef AF_BAN
   PyModule_AddIntConstant (m, "AF_BAN", AF_BAN);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_BAN),
-          PyString_FromString("AF_BAN"));
+          PyUnicode_FromString("AF_BAN"));
 #endif
 #ifdef AF_CLUSTER
   PyModule_AddIntConstant (m, "AF_CLUSTER", AF_CLUSTER);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_CLUSTER),
-          PyString_FromString("AF_CLUSTER"));
+          PyUnicode_FromString("AF_CLUSTER"));
 #endif
 #ifdef AF_12844
   PyModule_AddIntConstant (m, "AF_12844", AF_12844);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_12844),
-          PyString_FromString("AF_12844"));
+          PyUnicode_FromString("AF_12844"));
 #endif
 #ifdef AF_IRDA
   PyModule_AddIntConstant (m, "AF_IRDA", AF_IRDA);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_IRDA),
-          PyString_FromString("AF_IRDA"));
+          PyUnicode_FromString("AF_IRDA"));
 #endif
 #ifdef AF_NETDES
   PyModule_AddIntConstant (m, "AF_NETDES", AF_NETDES);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NETDES),
-          PyString_FromString("AF_NETDES"));
+          PyUnicode_FromString("AF_NETDES"));
 #endif
 #ifdef AF_NETROM
   PyModule_AddIntConstant (m, "AF_NETROM", AF_NETROM);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NETROM),
-          PyString_FromString("AF_NETROM"));
+          PyUnicode_FromString("AF_NETROM"));
 #endif
 #ifdef AF_BRIDGE
   PyModule_AddIntConstant (m, "AF_BRIDGE", AF_BRIDGE);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_BRIDGE),
-          PyString_FromString("AF_BRIDGE"));
+          PyUnicode_FromString("AF_BRIDGE"));
 #endif
 #ifdef AF_X25
   PyModule_AddIntConstant (m, "AF_X25", AF_X25);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_X25),
-          PyString_FromString("AF_X25"));
+          PyUnicode_FromString("AF_X25"));
 #endif
 #ifdef AF_ROSE
   PyModule_AddIntConstant (m, "AF_ROSE", AF_ROSE);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ROSE),
-          PyString_FromString("AF_ROSE"));
+          PyUnicode_FromString("AF_ROSE"));
 #endif
 #ifdef AF_SECURITY
   PyModule_AddIntConstant (m, "AF_SECURITY", AF_SECURITY);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_SECURITY),
-          PyString_FromString("AF_SECURITY"));
+          PyUnicode_FromString("AF_SECURITY"));
 #endif
 #ifdef AF_KEY
   PyModule_AddIntConstant (m, "AF_KEY", AF_KEY);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_KEY),
-          PyString_FromString("AF_KEY"));
+          PyUnicode_FromString("AF_KEY"));
 #endif
 #ifdef AF_NETLINK
   PyModule_AddIntConstant (m, "AF_NETLINK", AF_NETLINK);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_NETLINK),
-          PyString_FromString("AF_NETLINK"));
+          PyUnicode_FromString("AF_NETLINK"));
 #endif
 #ifdef AF_ASH
   PyModule_AddIntConstant (m, "AF_ASH", AF_ASH);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ASH),
-          PyString_FromString("AF_ASH"));
+          PyUnicode_FromString("AF_ASH"));
 #endif
 #ifdef AF_ECONET
   PyModule_AddIntConstant (m, "AF_ECONET", AF_ECONET);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_ECONET),
-          PyString_FromString("AF_ECONET"));
+          PyUnicode_FromString("AF_ECONET"));
 #endif
 #ifdef AF_SNA
   PyModule_AddIntConstant (m, "AF_SNA", AF_SNA);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_SNA),
-          PyString_FromString("AF_SNA"));
+          PyUnicode_FromString("AF_SNA"));
 #endif
 #ifdef AF_PPPOX
   PyModule_AddIntConstant (m, "AF_PPPOX", AF_PPPOX);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_PPPOX),
-          PyString_FromString("AF_PPPOX"));
+          PyUnicode_FromString("AF_PPPOX"));
 #endif
 #ifdef AF_WANPIPE
   PyModule_AddIntConstant (m, "AF_WANPIPE", AF_WANPIPE);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_WANPIPE),
-          PyString_FromString("AF_WANPIPE"));
+          PyUnicode_FromString("AF_WANPIPE"));
 #endif
 #ifdef AF_BLUETOOTH
   PyModule_AddIntConstant (m, "AF_BLUETOOTH", AF_BLUETOOTH);
   PyDict_SetItem(address_family_dict, PyInt_FromLong(AF_BLUETOOTH),
-          PyString_FromString("AF_BLUETOOTH"));
+          PyUnicode_FromString("AF_BLUETOOTH"));
+#endif
+#ifdef IN6_IFF_AUTOCONF
+  PyModule_AddIntConstant (m, "IN6_IFF_AUTOCONF", IN6_IFF_AUTOCONF);
+#endif
+#ifdef IN6_IFF_TEMPORARY
+  PyModule_AddIntConstant (m, "IN6_IFF_TEMPORARY", IN6_IFF_TEMPORARY);
+#endif
+#ifdef IN6_IFF_DYNAMIC
+  PyModule_AddIntConstant (m, "IN6_IFF_DYNAMIC", IN6_IFF_DYNAMIC);
+#endif
+#ifdef IN6_IFF_OPTIMISTIC
+  PyModule_AddIntConstant (m, "IN6_IFF_OPTIMISTIC", IN6_IFF_OPTIMISTIC);
+#endif
+#ifdef IN6_IFF_SECURED
+  PyModule_AddIntConstant (m, "IN6_IFF_SECURED", IN6_IFF_SECURED);
 #endif
   PyModule_AddObject(m, "address_families", address_family_dict);
 

@@ -1,3 +1,40 @@
+netifaces (0.11.0-2) unstable; urgency=medium
+
+  [ Debian Janitor ]
+  * Bump debhelper from old 12 to 13.
+  * Update standards version to 4.6.1, no changes needed.
+
+ -- Jelmer Vernooĳ <jelmer@debian.org>  Wed, 30 Nov 2022 17:06:23 +0000
+
+netifaces (0.11.0-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release.
+  * debian/control: Bump Standards-Version to 4.6.0.
+  * debian/control: Bump debhelper compat to v13.
+  * Drop python3-all-dbg from build dependency so that we do not
+    build the debug extension by default. (Closes: #994313)
+  * debian/python3-netifaces.install: Dropped,
+    now we have single binary package.
+  * Add pristine-tar branch in git packaging repo.
+    (Closes: #949718)
+
+  [ Ondřej Nový ]
+  * d/copyright: Use https protocol in Format field
+  * Use debhelper-compat instead of debian/compat.
+  * d/control: Update Maintainer field with new Debian Python Team
+    contact address.
+  * d/control: Update Vcs-* fields with new Debian Python Team Salsa
+    layout.
+
+  [ Debian Janitor ]
+  * Use secure URI in Homepage field.
+  * Remove patch build-in-python3.3.diff that is missing from
+    debian/patches/series.
+  * Make "Files: *" paragraph the first in the copyright file.
+
+ -- Boyuan Yang <byang@debian.org>  Fri, 22 Oct 2021 14:24:14 -0400
+
 netifaces (0.10.9-0.2) unstable; urgency=medium
 
   * Non-maintainer upload.

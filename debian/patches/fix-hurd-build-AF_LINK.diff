@@ -1,15 +1,23 @@
-Description: FTBFS on hurd-i386
- AF_LINK is defined, there is no sockaddr_dl
- struct for it.
- The attached patch makes netifaces.c pretend there is no AF_LINK
- (while still having it defined). I did a quick test, and the built
- python-netifaces seems working fine.
-Author: Pino Toscano <pino@debian.org>
+From: Pino Toscano <pino@debian.org>
+Date: Fri, 22 Jun 2012 14:03:06 +0200
+Subject: FTBFS on hurd-i386
+
 Bug-Debian: http://bugs.debian.org/676756
 
---- netifaces-0.8.orig/netifaces.c
-+++ netifaces-0.8/netifaces.c
-@@ -171,6 +171,8 @@ static int af_to_len(int af)
+AF_LINK is defined, there is no sockaddr_dl
+struct for it.
+The attached patch makes netifaces.c pretend there is no AF_LINK
+(while still having it defined). I did a quick test, and the built
+python-netifaces seems working fine.
+---
+ netifaces.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/netifaces.c b/netifaces.c
+index fa18add..1d50fb5 100644
+--- a/netifaces.c
++++ b/netifaces.c
+@@ -239,6 +239,8 @@ static int af_to_len(int af)
  #    define AF_LINK  -1000
  #  endif
  #  define HAVE_AF_LINK 0

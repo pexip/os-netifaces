@@ -462,9 +462,9 @@ string_from_netmask (struct sockaddr *addr,
         --zx;
       if (x & 0x0f)
         zx -= 4;
-      if (x & 0x03)
+      if (x & 0x33)
         zx -= 2;
-      if (x & 0x05)
+      if (x & 0x55)
         zx -= 1;
 
       zeroes += zx;
@@ -1024,7 +1024,7 @@ ifaddrs (PyObject *self, PyObject *args)
     char buffer[256];
     PyObject *pyaddr = NULL, *netmask = NULL, *braddr = NULL, *flags = NULL;
 
-    if (strcmp (addr->ifa_name, ifname) != 0)
+    if (addr->ifa_name == NULL || strcmp (addr->ifa_name, ifname) != 0)
       continue;
  
     /* We mark the interface as found, even if there are no addresses;
@@ -1357,6 +1357,9 @@ interfaces (PyObject *self)
   }
 
   for (addr = addrs; addr; addr = addr->ifa_next) {
+    if (addr->ifa_name == NULL)
+      continue;
+
     if (!prev_name || strncmp (addr->ifa_name, prev_name, IFNAMSIZ) != 0) {
       PyObject *ifname = PyUnicode_FromString (addr->ifa_name);
     
@@ -1564,7 +1567,7 @@ gateways (PyObject *self)
 	  break;
 	}
 
-	ifname = PyUnicode_FromUnicode (pwcsName, wcslen (pwcsName));
+	ifname = PyUnicode_FromWideChar (pwcsName, wcslen (pwcsName));
 	isdefault = bBest ? Py_True : Py_False;
 
 	tuple = PyTuple_Pack (3, gateway, ifname, isdefault);
@@ -1671,7 +1674,7 @@ gateways (PyObject *self)
       if (bBest)
         dwBestMetric = table->table[n].dwForwardMetric1;
 
-      ifname = PyUnicode_FromUnicode (pwcsName, wcslen (pwcsName));
+      ifname = PyUnicode_FromWideChar (pwcsName, wcslen (pwcsName));
       gateway = PyUnicode_FromString (gwbuf);
       isdefault = bBest ? Py_True : Py_False;
 
@@ -1891,8 +1894,14 @@ gateways (PyObject *self)
           attr = RTA_NEXT(attr, len);
         }
 
+        static const unsigned char ipv4_default[4] = {};
+        static const unsigned char ipv6_default[16] = {};
+
         /* We're looking for gateways with no destination */
-        if (!dst && gw && ifndx >= 0) {
+        if ((!dst
+            || (pmsg->rt.rtm_family == AF_INET && !memcmp(dst, ipv4_default, sizeof(ipv4_default)))
+            || (pmsg->rt.rtm_family == AF_INET6 && !memcmp(dst, ipv6_default, sizeof(ipv6_default)))
+        ) && gw && ifndx >= 0) {
           char buffer[256];
           char ifnamebuf[IF_NAMESIZE];
           char *ifname;
@@ -1918,16 +1927,22 @@ gateways (PyObject *self)
 
           isdefault = pmsg->rt.rtm_table == RT_TABLE_MAIN ? Py_True : Py_False;
 
+          /* Priority starts at 0, having none means we use kernel default (0) */
+          if (priority < 0) {
+            priority = 0;
+          }
+
           /* Try to pick the active default route based on priority (which
              is displayed in the UI as "metric", confusingly) */
           if (pmsg->rt.rtm_family < RTNL_FAMILY_MAX) {
-            if (def_priorities[pmsg->rt.rtm_family] == -1)
+            /* If no active default route found, or metric is lower */
+            if (def_priorities[pmsg->rt.rtm_family] == -1
+                || priority < def_priorities[pmsg->rt.rtm_family])
+              /* Set new default */
               def_priorities[pmsg->rt.rtm_family] = priority;
-            else {
-              if (priority == -1
-                  || priority > def_priorities[pmsg->rt.rtm_family])
-                isdefault = Py_False;
-            }
+            else
+              /* Leave default, but unset isdefault for iface tuple */
+              isdefault = Py_False;
           }
 
           pyifname = PyUnicode_FromString (ifname);

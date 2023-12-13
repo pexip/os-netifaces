@@ -1,3 +1,9 @@
+netifaces (0.11.0-2+b1pexip1) pexip-bookworm; urgency=medium
+
+  * Bump version to supersede Debian point release binNMU.
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Wed, 13 Dec 2023 12:26:00 +0000
+
 netifaces (0.11.0-2pexip2) pexip-bookworm; urgency=medium
 
   * Bookworm build for product distribution

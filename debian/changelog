@@ -1,3 +1,9 @@
+netifaces (0.11.0-2+b6+pexip25u1) pexip-trixie; urgency=medium
+
+  * Rebuild to supercede trixie NMUs
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Thu, 20 Aug 2026 13:16:18 +0100
+
 netifaces (0.11.0-2+b1+pexip25u2) pexip-trixie; urgency=medium
 
   * Trixie build for product distribution
